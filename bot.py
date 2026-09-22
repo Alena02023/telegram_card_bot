@@ -34,7 +34,7 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-DATABASE = "bot.db"
+DATABASE = "bot_demo_clean.db"
 
 
 # =========================================================
