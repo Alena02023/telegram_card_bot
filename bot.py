@@ -5,10 +5,21 @@ import logging
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    FSInputFile,
+)
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения
+
+# -------------------------
+# НАСТРОЙКИ
+# -------------------------
+
+logging.basicConfig(level=logging.INFO)
+
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -16,11 +27,8 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("BOT_TOKEN не найден")
 
-# Создаём бота
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-
-logging.basicConfig(level=logging.INFO)
 
 
 # -------------------------
@@ -34,7 +42,7 @@ cards = {
             f"Это тестовое описание карты №{i}.\n\n"
             "Позже здесь будет настоящее описание карты, "
             "которое предоставит заказчик."
-        )
+        ),
     }
     for i in range(1, 46)
 }
@@ -47,17 +55,55 @@ cards = {
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
-            KeyboardButton(text="🎴 Выбрать случайную карту")
+            KeyboardButton(
+                text="🎴 Выбрать случайную карту"
+            )
         ],
         [
-            KeyboardButton(text="🔢 Выбрать карту по номеру")
+            KeyboardButton(
+                text="🔢 Выбрать карту по номеру"
+            )
         ],
         [
-            KeyboardButton(text="✨ Хочу больше карт")
-        ]
+            KeyboardButton(
+                text="✨ Хочу больше карт"
+            )
+        ],
     ],
-    resize_keyboard=True
+    resize_keyboard=True,
 )
+
+
+# -------------------------
+# ФУНКЦИЯ ОТПРАВКИ КАРТЫ
+# -------------------------
+
+async def send_card(message: Message, card_number: int):
+
+    card = cards[card_number]
+
+    image_path = f"cards/card_{card_number}.png"
+
+    # Проверяем, существует ли изображение
+    if os.path.exists(image_path):
+
+        photo = FSInputFile(image_path)
+
+        await message.answer_photo(
+            photo=photo,
+            caption=(
+                f"🎴 {card['title']}\n\n"
+                f"{card['description']}"
+            ),
+        )
+
+    else:
+        # Если картинки вдруг нет, бот всё равно отправит текст
+        await message.answer(
+            f"🎴 {card['title']}\n\n"
+            f"{card['description']}\n\n"
+            "⚠️ Изображение карты пока не найдено."
+        )
 
 
 # -------------------------
@@ -72,7 +118,7 @@ async def start_handler(message: Message):
         "Перед вами колода из 45 карт.\n\n"
         "Вы можете выбрать случайную карту "
         "или указать её номер самостоятельно.",
-        reply_markup=main_keyboard
+        reply_markup=main_keyboard,
     )
 
 
@@ -84,28 +130,27 @@ async def start_handler(message: Message):
 async def random_card_handler(message: Message):
 
     card_number = secrets.randbelow(45) + 1
-    card = cards[card_number]
 
-    await message.answer(
-        f"🎴 {card['title']}\n\n"
-        f"{card['description']}"
+    await send_card(
+        message=message,
+        card_number=card_number,
     )
 
 
 # -------------------------
-# ВЫБОР ПО НОМЕРУ
+# ВЫБОР КАРТЫ ПО НОМЕРУ
 # -------------------------
 
 @dp.message(F.text == "🔢 Выбрать карту по номеру")
 async def choose_number_handler(message: Message):
 
     await message.answer(
-        "Введите номер карты от 1 до 45:"
+        "🔢 Введите номер карты от 1 до 45:"
     )
 
 
 # -------------------------
-# КНОПКА ПОКУПКИ
+# ХОЧУ БОЛЬШЕ КАРТ
 # -------------------------
 
 @dp.message(F.text == "✨ Хочу больше карт")
@@ -114,12 +159,13 @@ async def more_cards_handler(message: Message):
     await message.answer(
         "✨ Здесь скоро появится возможность "
         "приобрести дополнительные карты.\n\n"
-        "На следующем этапе мы добавим тарифы и оплату."
+        "На следующем этапе мы добавим тарифы "
+        "и тестовую оплату."
     )
 
 
 # -------------------------
-# ОБРАБОТКА ЧИСЕЛ
+# ОБРАБОТКА НОМЕРА КАРТЫ
 # -------------------------
 
 @dp.message(F.text.regexp(r"^\d+$"))
@@ -129,17 +175,15 @@ async def number_handler(message: Message):
 
     if 1 <= number <= 45:
 
-        card = cards[number]
-
-        await message.answer(
-            f"🎴 {card['title']}\n\n"
-            f"{card['description']}"
+        await send_card(
+            message=message,
+            card_number=number,
         )
 
     else:
 
         await message.answer(
-            "Такой карты нет.\n\n"
+            "❌ Такой карты нет.\n\n"
             "Введите номер от 1 до 45."
         )
 
@@ -153,12 +197,12 @@ async def other_message_handler(message: Message):
 
     await message.answer(
         "Пожалуйста, воспользуйтесь кнопками меню 👇",
-        reply_markup=main_keyboard
+        reply_markup=main_keyboard,
     )
 
 
 # -------------------------
-# ЗАПУСК
+# ЗАПУСК БОТА
 # -------------------------
 
 async def main():
