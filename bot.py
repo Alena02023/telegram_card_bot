@@ -109,28 +109,48 @@ main_keyboard = ReplyKeyboardMarkup(
 # КЛАВИАТУРА ТАРИФОВ
 # =========================================================
 
-tariffs_keyboard = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="🎴 1 карта — 50 ₽",
-                callback_data="tariff_1",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="🎴 3 карты — 120 ₽",
-                callback_data="tariff_3",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="🎴 5 карт — 180 ₽",
-                callback_data="tariff_5",
-            )
-        ],
-    ]
-)
+def get_tariffs_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎴 1 карта — 50 ₽",
+                    callback_data="tariff_1",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎴 3 карты — 120 ₽",
+                    callback_data="tariff_3",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎴 5 карт — 180 ₽",
+                    callback_data="tariff_5",
+                )
+            ],
+        ]
+    )
+
+
+# =========================================================
+# КНОПКА "ХОЧУ БОЛЬШЕ КАРТ"
+# =========================================================
+
+def get_buy_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✨ Хочу больше карт",
+                    callback_data="show_tariffs",
+                )
+            ]
+        ]
+    )
 
 
 # =========================================================
@@ -191,7 +211,10 @@ async def get_balance(user_id: int) -> int:
         return 0
 
 
-async def add_cards(user_id: int, amount: int):
+async def add_cards(
+    user_id: int,
+    amount: int,
+):
 
     await create_user(user_id)
 
@@ -231,6 +254,23 @@ async def use_card(user_id: int) -> bool:
 
 
 # =========================================================
+# ПОКАЗАТЬ ТАРИФЫ
+# =========================================================
+
+async def send_tariffs(message: Message):
+
+    await message.answer(
+        "✨ Выберите пакет дополнительных карт:\n\n"
+        "🎴 1 карта — 50 ₽\n"
+        "🎴 3 карты — 120 ₽\n"
+        "🎴 5 карт — 180 ₽\n\n"
+        "Сейчас используется демонстрационная оплата.\n"
+        "Настоящие деньги списываться не будут.",
+        reply_markup=get_tariffs_keyboard(),
+    )
+
+
+# =========================================================
 # ОТПРАВКА КАРТЫ
 # =========================================================
 
@@ -243,13 +283,13 @@ async def send_card(
 
     success = await use_card(user_id)
 
+    # Если карт уже нет
     if not success:
 
         await message.answer(
             "✨ У вас закончились доступные карты.\n\n"
-            "Чтобы открыть ещё карты, нажмите "
-            "«✨ Хочу больше карт».",
-            reply_markup=main_keyboard,
+            "Выберите пакет, чтобы получить новые карты:",
+            reply_markup=get_tariffs_keyboard(),
         )
 
         return
@@ -267,6 +307,21 @@ async def send_card(
         f"💰 Осталось карт: {balance}"
     )
 
+    # Если пользователь только что потратил последнюю карту
+    if balance == 0:
+
+        caption += (
+            "\n\n"
+            "✨ Это была ваша последняя доступная карта.\n"
+            "Хотите открыть ещё?"
+        )
+
+        reply_markup = get_buy_keyboard()
+
+    else:
+
+        reply_markup = None
+
     if os.path.exists(image_path):
 
         photo = FSInputFile(image_path)
@@ -274,13 +329,14 @@ async def send_card(
         await message.answer_photo(
             photo=photo,
             caption=caption,
+            reply_markup=reply_markup,
         )
 
     else:
 
         await message.answer(
-            caption
-            + "\n\n⚠️ Изображение карты пока не найдено."
+            caption,
+            reply_markup=reply_markup,
         )
 
 
@@ -297,20 +353,33 @@ async def start_handler(message: Message):
         message.from_user.id
     )
 
-    await message.answer(
+    text = (
         "🎴 Добро пожаловать!\n\n"
         "Перед вами колода из 45 карт.\n\n"
-        "🎁 При первом запуске вы получаете "
+        "🎁 Новый пользователь получает "
         "1 бесплатную карту.\n\n"
         "Вы можете выбрать случайную карту "
         "или указать её номер самостоятельно.\n\n"
-        f"💰 Доступно карт: {balance}",
+        f"💰 Доступно карт: {balance}"
+    )
+
+    await message.answer(
+        text,
         reply_markup=main_keyboard,
     )
 
+    # Если пользователь уже потратил карту
+    if balance == 0:
+
+        await message.answer(
+            "✨ У вас сейчас нет доступных карт.\n\n"
+            "Вы можете приобрести дополнительные:",
+            reply_markup=get_tariffs_keyboard(),
+        )
+
 
 # =========================================================
-# БАЛАНС
+# МОЙ БАЛАНС
 # =========================================================
 
 @dp.message(F.text == "💰 Мой баланс")
@@ -320,9 +389,19 @@ async def balance_handler(message: Message):
         message.from_user.id
     )
 
-    await message.answer(
-        f"💰 Ваш баланс: {balance} карт."
-    )
+    if balance > 0:
+
+        await message.answer(
+            f"💰 Ваш баланс: {balance} карт."
+        )
+
+    else:
+
+        await message.answer(
+            "💰 Ваш баланс: 0 карт.\n\n"
+            "✨ Хотите получить дополнительные карты?",
+            reply_markup=get_tariffs_keyboard(),
+        )
 
 
 # =========================================================
@@ -331,6 +410,20 @@ async def balance_handler(message: Message):
 
 @dp.message(F.text == "🎴 Выбрать случайную карту")
 async def random_card_handler(message: Message):
+
+    balance = await get_balance(
+        message.from_user.id
+    )
+
+    if balance <= 0:
+
+        await message.answer(
+            "✨ У вас закончились доступные карты.\n\n"
+            "Выберите пакет:",
+            reply_markup=get_tariffs_keyboard(),
+        )
+
+        return
 
     card_number = secrets.randbelow(45) + 1
 
@@ -341,7 +434,7 @@ async def random_card_handler(message: Message):
 
 
 # =========================================================
-# ВЫБОР ПО НОМЕРУ
+# ВЫБОР КАРТЫ ПО НОМЕРУ
 # =========================================================
 
 @dp.message(F.text == "🔢 Выбрать карту по номеру")
@@ -355,8 +448,8 @@ async def choose_number_handler(message: Message):
 
         await message.answer(
             "✨ У вас закончились доступные карты.\n\n"
-            "Нажмите «✨ Хочу больше карт», "
-            "чтобы получить дополнительные карты."
+            "Выберите пакет:",
+            reply_markup=get_tariffs_keyboard(),
         )
 
         return
@@ -367,20 +460,34 @@ async def choose_number_handler(message: Message):
 
 
 # =========================================================
-# ПОКУПКА ДОПОЛНИТЕЛЬНЫХ КАРТ
+# КНОПКА ГЛАВНОГО МЕНЮ "ХОЧУ БОЛЬШЕ КАРТ"
 # =========================================================
 
 @dp.message(F.text == "✨ Хочу больше карт")
 async def more_cards_handler(message: Message):
 
-    await message.answer(
+    await send_tariffs(message)
+
+
+# =========================================================
+# INLINE-КНОПКА "ХОЧУ БОЛЬШЕ КАРТ"
+# =========================================================
+
+@dp.callback_query(F.data == "show_tariffs")
+async def show_tariffs_handler(
+    callback: CallbackQuery,
+):
+
+    await callback.message.answer(
         "✨ Выберите пакет дополнительных карт:\n\n"
         "🎴 1 карта — 50 ₽\n"
         "🎴 3 карты — 120 ₽\n"
         "🎴 5 карт — 180 ₽\n\n"
         "Сейчас используется демонстрационная оплата.",
-        reply_markup=tariffs_keyboard,
+        reply_markup=get_tariffs_keyboard(),
     )
+
+    await callback.answer()
 
 
 # =========================================================
@@ -425,11 +532,11 @@ async def tariff_handler(
     )
 
     await callback.message.edit_text(
-        f"🎴 Вы выбрали пакет:\n\n"
+        "🎴 Вы выбрали пакет:\n\n"
         f"Количество карт: {cards_amount}\n"
         f"Стоимость: {price} ₽\n\n"
-        "Для демонстрации нажмите кнопку оплаты.\n"
-        "Настоящие деньги списываться не будут.",
+        "Для демонстрации нажмите кнопку оплаты.\n\n"
+        "⚠️ Настоящие деньги списываться не будут.",
         reply_markup=payment_keyboard,
     )
 
@@ -451,7 +558,7 @@ async def back_to_tariffs_handler(
         "🎴 3 карты — 120 ₽\n"
         "🎴 5 карт — 180 ₽\n\n"
         "Сейчас используется демонстрационная оплата.",
-        reply_markup=tariffs_keyboard,
+        reply_markup=get_tariffs_keyboard(),
     )
 
     await callback.answer()
@@ -483,6 +590,9 @@ async def payment_handler(
 
     user_id = callback.from_user.id
 
+    # ДЕМО:
+    # реальной оплаты здесь пока нет.
+    # Просто начисляем выбранное количество карт.
     await add_cards(
         user_id=user_id,
         amount=cards_amount,
@@ -492,19 +602,19 @@ async def payment_handler(
 
     await callback.message.edit_text(
         "✅ ДЕМО-ОПЛАТА УСПЕШНА\n\n"
-        f"Сумма: {price} ₽\n"
-        f"Начислено карт: {cards_amount}\n\n"
+        f"💳 Сумма: {price} ₽\n"
+        f"🎴 Начислено карт: {cards_amount}\n\n"
         f"💰 Теперь доступно карт: {balance}\n\n"
-        "Вы можете продолжить выбирать карты."
+        "Можете продолжить выбирать карты 👇"
     )
 
     await callback.answer(
-        "Карты начислены! 🎴"
+        "Карты начислены!"
     )
 
 
 # =========================================================
-# ОБРАБОТКА ЧИСЕЛ
+# ОБРАБОТКА НОМЕРОВ 1–45
 # =========================================================
 
 @dp.message(F.text.regexp(r"^\d+$"))
@@ -512,19 +622,33 @@ async def number_handler(message: Message):
 
     number = int(message.text)
 
-    if 1 <= number <= 45:
-
-        await send_card(
-            message=message,
-            card_number=number,
-        )
-
-    else:
+    if not 1 <= number <= 45:
 
         await message.answer(
             "❌ Такой карты нет.\n\n"
             "Введите номер от 1 до 45."
         )
+
+        return
+
+    balance = await get_balance(
+        message.from_user.id
+    )
+
+    if balance <= 0:
+
+        await message.answer(
+            "✨ У вас закончились доступные карты.\n\n"
+            "Выберите пакет:",
+            reply_markup=get_tariffs_keyboard(),
+        )
+
+        return
+
+    await send_card(
+        message=message,
+        card_number=number,
+    )
 
 
 # =========================================================
@@ -541,7 +665,7 @@ async def other_message_handler(message: Message):
 
 
 # =========================================================
-# ЗАПУСК
+# ЗАПУСК БОТА
 # =========================================================
 
 async def main():
