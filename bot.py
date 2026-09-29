@@ -5,7 +5,7 @@ import os
 import secrets
 from pathlib import Path
 
-import aiosqlite
+import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
@@ -34,9 +34,10 @@ if not TOKEN:
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Пока оставляем текущую demo-базу.
-# PostgreSQL подключим отдельным следующим этапом.
-DATABASE = BASE_DIR / "bot_demo_clean.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL не найден в переменных окружения")
 
 CARDS_FILE = BASE_DIR / "cards.json"
 WELCOME_VIDEO_1 = BASE_DIR / "media" / "welcome_video_1.mp4"
@@ -196,131 +197,131 @@ def get_payment_keyboard(tariff_key: str):
 # =========================================================
 
 async def init_db():
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                balance INTEGER NOT NULL DEFAULT 1
+                user_id BIGINT PRIMARY KEY,
+                balance INTEGER NOT NULL DEFAULT 1,
+                intro_seen BOOLEAN NOT NULL DEFAULT FALSE
             )
             """
         )
-
-        # Для существующей базы добавляем отметку о прохождении приветствия.
-        cursor = await db.execute("PRAGMA table_info(users)")
-        columns = [row[1] for row in await cursor.fetchall()]
-        if "intro_seen" not in columns:
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN intro_seen INTEGER NOT NULL DEFAULT 0"
-            )
-
-        await db.commit()
+    finally:
+        await conn.close()
 
 
 async def create_user(user_id: int):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute(
             """
-            INSERT OR IGNORE INTO users (
-                user_id,
-                balance
-            )
-            VALUES (?, 1)
+            INSERT INTO users (user_id, balance, intro_seen)
+            VALUES ($1, 1, FALSE)
+            ON CONFLICT (user_id) DO NOTHING
             """,
-            (user_id,),
+            user_id,
         )
-
-        await db.commit()
+    finally:
+        await conn.close()
 
 
 async def get_balance(user_id: int) -> int:
     await create_user(user_id)
 
-    async with aiosqlite.connect(DATABASE) as db:
-        cursor = await db.execute(
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        balance = await conn.fetchval(
             """
             SELECT balance
             FROM users
-            WHERE user_id = ?
+            WHERE user_id = $1
             """,
-            (user_id,),
+            user_id,
         )
+    finally:
+        await conn.close()
 
-        row = await cursor.fetchone()
-
-    if row is None:
-        return 0
-
-    return row[0]
+    return int(balance or 0)
 
 
-async def add_cards(
-    user_id: int,
-    amount: int,
-):
+async def add_cards(user_id: int, amount: int):
     await create_user(user_id)
 
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute(
             """
             UPDATE users
-            SET balance = balance + ?
-            WHERE user_id = ?
+            SET balance = balance + $1
+            WHERE user_id = $2
             """,
-            (
-                amount,
-                user_id,
-            ),
+            amount,
+            user_id,
         )
-
-        await db.commit()
+    finally:
+        await conn.close()
 
 
 async def use_card(user_id: int) -> bool:
     """
-    Списывает одну карту только при наличии баланса.
-
-    UPDATE выполняется атомарно, поэтому баланс
-    не должен уйти ниже нуля.
+    Атомарно списывает одну карту,
+    только если баланс больше нуля.
     """
-
     await create_user(user_id)
 
-    async with aiosqlite.connect(DATABASE) as db:
-        cursor = await db.execute(
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        result = await conn.execute(
             """
             UPDATE users
             SET balance = balance - 1
-            WHERE user_id = ?
+            WHERE user_id = $1
               AND balance > 0
             """,
-            (user_id,),
+            user_id,
         )
+    finally:
+        await conn.close()
 
-        await db.commit()
-
-        return cursor.rowcount > 0
+    return result == "UPDATE 1"
 
 
 async def has_seen_intro(user_id: int) -> bool:
     await create_user(user_id)
-    async with aiosqlite.connect(DATABASE) as db:
-        cursor = await db.execute(
-            "SELECT intro_seen FROM users WHERE user_id = ?",
-            (user_id,),
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        value = await conn.fetchval(
+            """
+            SELECT intro_seen
+            FROM users
+            WHERE user_id = $1
+            """,
+            user_id,
         )
-        row = await cursor.fetchone()
-    return bool(row and row[0])
+    finally:
+        await conn.close()
+
+    return bool(value)
 
 
 async def mark_intro_seen(user_id: int):
     await create_user(user_id)
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "UPDATE users SET intro_seen = 1 WHERE user_id = ?",
-            (user_id,),
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute(
+            """
+            UPDATE users
+            SET intro_seen = TRUE
+            WHERE user_id = $1
+            """,
+            user_id,
         )
-        await db.commit()
+    finally:
+        await conn.close()
 
 
 # =========================================================
@@ -824,6 +825,11 @@ async def payment_callback(
         f"Начислено карт: {tariff['cards']}\n"
         f"💫 Новый баланс: {new_balance}\n\n"
         "Теперь можно открыть карту."
+    )
+
+    await callback.message.answer(
+        "Выберите, как хотите получить подсказку:",
+        reply_markup=main_keyboard,
     )
 
 
