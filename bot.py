@@ -1,7 +1,9 @@
 import asyncio
+import json
 import logging
 import os
 import secrets
+from pathlib import Path
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
@@ -22,36 +24,48 @@ from dotenv import load_dotenv
 # НАСТРОЙКИ
 # =========================================================
 
-logging.basicConfig(level=logging.INFO)
-
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
 
 if not TOKEN:
-    raise ValueError("BOT_TOKEN не найден")
+    raise ValueError("BOT_TOKEN не найден в .env")
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
 
-DATABASE = "bot_demo_clean.db"
+BASE_DIR = Path(__file__).resolve().parent
+
+# Пока оставляем текущую demo-базу.
+# PostgreSQL подключим отдельным следующим этапом.
+DATABASE = BASE_DIR / "bot_demo_clean.db"
+
+CARDS_FILE = BASE_DIR / "cards.json"
 
 
 # =========================================================
-# 45 ТЕСТОВЫХ КАРТ
+# ЗАГРУЗКА 45 КАРТ
 # =========================================================
+
+if not CARDS_FILE.exists():
+    raise FileNotFoundError(
+        f"Не найден файл {CARDS_FILE}. "
+        "Сначала создайте cards.json."
+    )
+
+
+with CARDS_FILE.open("r", encoding="utf-8") as file:
+    raw_cards = json.load(file)
+
 
 cards = {
-    i: {
-        "title": f"Карта №{i}",
-        "description": (
-            f"Это тестовое описание карты №{i}.\n\n"
-            "Позже здесь будет настоящее описание карты, "
-            "которое предоставит заказчик."
-        ),
-    }
-    for i in range(1, 46)
+    int(number): data
+    for number, data in raw_cards.items()
 }
+
+
+if set(cards.keys()) != set(range(1, 46)):
+    raise ValueError(
+        "В cards.json должны находиться карты №1–45."
+    )
 
 
 # =========================================================
@@ -75,7 +89,7 @@ tariffs = {
 
 
 # =========================================================
-# ГЛАВНОЕ МЕНЮ
+# КЛАВИАТУРЫ
 # =========================================================
 
 main_keyboard = ReplyKeyboardMarkup(
@@ -105,29 +119,24 @@ main_keyboard = ReplyKeyboardMarkup(
 )
 
 
-# =========================================================
-# КЛАВИАТУРА ТАРИФОВ
-# =========================================================
-
 def get_tariffs_keyboard():
-
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🎴 1 карта — 50 ₽",
+                    text="1 карта — 50 ₽",
                     callback_data="tariff_1",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🎴 3 карты — 120 ₽",
+                    text="3 карты — 120 ₽",
                     callback_data="tariff_3",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🎴 5 карт — 180 ₽",
+                    text="5 карт — 180 ₽",
                     callback_data="tariff_5",
                 )
             ],
@@ -135,12 +144,7 @@ def get_tariffs_keyboard():
     )
 
 
-# =========================================================
-# КНОПКА "ХОЧУ БОЛЬШЕ КАРТ"
-# =========================================================
-
 def get_buy_keyboard():
-
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -153,14 +157,33 @@ def get_buy_keyboard():
     )
 
 
+def get_payment_keyboard(tariff_key: str):
+    tariff = tariffs[tariff_key]
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"💳 Оплатить {tariff['price']} ₽",
+                    callback_data=f"pay_{tariff_key}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="← Назад к тарифам",
+                    callback_data="back_to_tariffs",
+                )
+            ],
+        ]
+    )
+
+
 # =========================================================
 # БАЗА ДАННЫХ
 # =========================================================
 
 async def init_db():
-
     async with aiosqlite.connect(DATABASE) as db:
-
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -174,12 +197,13 @@ async def init_db():
 
 
 async def create_user(user_id: int):
-
     async with aiosqlite.connect(DATABASE) as db:
-
         await db.execute(
             """
-            INSERT OR IGNORE INTO users (user_id, balance)
+            INSERT OR IGNORE INTO users (
+                user_id,
+                balance
+            )
             VALUES (?, 1)
             """,
             (user_id,),
@@ -189,11 +213,9 @@ async def create_user(user_id: int):
 
 
 async def get_balance(user_id: int) -> int:
-
     await create_user(user_id)
 
     async with aiosqlite.connect(DATABASE) as db:
-
         cursor = await db.execute(
             """
             SELECT balance
@@ -205,39 +227,45 @@ async def get_balance(user_id: int) -> int:
 
         row = await cursor.fetchone()
 
-        if row:
-            return row[0]
-
+    if row is None:
         return 0
+
+    return row[0]
 
 
 async def add_cards(
     user_id: int,
     amount: int,
 ):
-
     await create_user(user_id)
 
     async with aiosqlite.connect(DATABASE) as db:
-
         await db.execute(
             """
             UPDATE users
             SET balance = balance + ?
             WHERE user_id = ?
             """,
-            (amount, user_id),
+            (
+                amount,
+                user_id,
+            ),
         )
 
         await db.commit()
 
 
 async def use_card(user_id: int) -> bool:
+    """
+    Списывает одну карту только при наличии баланса.
+
+    UPDATE выполняется атомарно, поэтому баланс
+    не должен уйти ниже нуля.
+    """
 
     await create_user(user_id)
 
     async with aiosqlite.connect(DATABASE) as db:
-
         cursor = await db.execute(
             """
             UPDATE users
@@ -254,18 +282,89 @@ async def use_card(user_id: int) -> bool:
 
 
 # =========================================================
-# ПОКАЗАТЬ ТАРИФЫ
+# РАБОТА С ДЛИННЫМ ТЕКСТОМ
+# =========================================================
+
+def split_long_text(
+    text: str,
+    max_length: int = 3900,
+):
+    """
+    Делит длинную расшифровку на сообщения.
+
+    Сначала стараемся разделять по абзацам.
+    Если отдельный абзац слишком большой,
+    делим его дополнительно.
+    """
+
+    text = text.strip()
+
+    if not text:
+        return []
+
+    if len(text) <= max_length:
+        return [text]
+
+    paragraphs = text.split("\n\n")
+
+    parts = []
+    current = ""
+
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+
+        if not paragraph:
+            continue
+
+        candidate = (
+            paragraph
+            if not current
+            else current + "\n\n" + paragraph
+        )
+
+        if len(candidate) <= max_length:
+            current = candidate
+            continue
+
+        if current:
+            parts.append(current)
+            current = ""
+
+        # Если сам абзац оказался слишком длинным
+        while len(paragraph) > max_length:
+            split_position = paragraph.rfind(
+                " ",
+                0,
+                max_length,
+            )
+
+            if split_position <= 0:
+                split_position = max_length
+
+            parts.append(
+                paragraph[:split_position].strip()
+            )
+
+            paragraph = paragraph[
+                split_position:
+            ].strip()
+
+        current = paragraph
+
+    if current:
+        parts.append(current)
+
+    return parts
+
+
+# =========================================================
+# ТАРИФЫ
 # =========================================================
 
 async def send_tariffs(message: Message):
-
     await message.answer(
-        "✨ Выберите пакет дополнительных карт:\n\n"
-        "🎴 1 карта — 50 ₽\n"
-        "🎴 3 карты — 120 ₽\n"
-        "🎴 5 карт — 180 ₽\n\n"
-        "Сейчас используется демонстрационная оплата.\n"
-        "Настоящие деньги списываться не будут.",
+        "✨ Хотите открыть ещё карты?\n\n"
+        "Выберите подходящий вариант:",
         reply_markup=get_tariffs_keyboard(),
     )
 
@@ -278,66 +377,80 @@ async def send_card(
     message: Message,
     card_number: int,
 ):
-
     user_id = message.from_user.id
 
     success = await use_card(user_id)
 
-    # Если карт уже нет
     if not success:
-
         await message.answer(
-            "✨ У вас закончились доступные карты.\n\n"
-            "Выберите пакет, чтобы получить новые карты:",
-            reply_markup=get_tariffs_keyboard(),
+            "У вас закончились доступные карты."
         )
+
+        await send_tariffs(message)
 
         return
 
     card = cards[card_number]
 
-    image_path = f"cards/card_{card_number}.png"
+    title = card["title"]
+    description = card["description"]
+
+    image_path = BASE_DIR / card["image"]
+
+    if not image_path.exists():
+        # Если изображения почему-то нет,
+        # возвращаем пользователю списанную карту.
+        await add_cards(user_id, 1)
+
+        await message.answer(
+            "Не удалось найти изображение этой карты.\n"
+            "Карта не была списана с вашего баланса."
+        )
+
+        logging.error(
+            "Не найден файл изображения: %s",
+            image_path,
+        )
+
+        return
+
+    photo = FSInputFile(image_path)
+
+    # На фото оставляем только короткую подпись.
+    await message.answer_photo(
+        photo=photo,
+        caption=(
+            f"✨ Карта №{card_number}\n"
+            f"«{title}»"
+        ),
+    )
+
+    # Полную расшифровку отправляем отдельно.
+    text_parts = split_long_text(description)
+
+    for part in text_parts:
+        await message.answer(part)
 
     balance = await get_balance(user_id)
 
-    caption = (
-        f"🎴 {card['title']}\n\n"
-        f"{card['description']}\n\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"💰 Осталось карт: {balance}"
-    )
-
-    # Если пользователь только что потратил последнюю карту
-    if balance == 0:
-
-        caption += (
-            "\n\n"
-            "✨ Это была ваша последняя доступная карта.\n"
-            "Хотите открыть ещё?"
-        )
-
-        reply_markup = get_buy_keyboard()
-
-    else:
-
-        reply_markup = None
-
-    if os.path.exists(image_path):
-
-        photo = FSInputFile(image_path)
-
-        await message.answer_photo(
-            photo=photo,
-            caption=caption,
-            reply_markup=reply_markup,
-        )
-
-    else:
-
+    if balance > 0:
         await message.answer(
-            caption,
-            reply_markup=reply_markup,
+            f"💫 Осталось карт: {balance}"
         )
+
+    else:
+        await message.answer(
+            "Это была ваша последняя доступная карта.\n\n"
+            "Хотите открыть ещё?",
+            reply_markup=get_buy_keyboard(),
+        )
+
+
+# =========================================================
+# DISPATCHER
+# =========================================================
+
+dp = Dispatcher()
 
 
 # =========================================================
@@ -346,90 +459,69 @@ async def send_card(
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
+    user_id = message.from_user.id
 
-    await create_user(message.from_user.id)
+    await create_user(user_id)
 
-    balance = await get_balance(
-        message.from_user.id
-    )
-
-    text = (
-        "🎴 Добро пожаловать!\n\n"
-        "Перед вами колода из 45 карт.\n\n"
-        "🎁 Новый пользователь получает "
-        "1 бесплатную карту.\n\n"
-        "Вы можете выбрать случайную карту "
-        "или указать её номер самостоятельно.\n\n"
-        f"💰 Доступно карт: {balance}"
-    )
+    balance = await get_balance(user_id)
 
     await message.answer(
-        text,
+        "✨ Добро пожаловать в «Следы праматери».\n\n"
+        "Вы можете довериться случаю и получить "
+        "случайную карту или выбрать карту "
+        "по номеру от 1 до 45.\n\n"
+        f"💫 Доступно карт: {balance}",
         reply_markup=main_keyboard,
     )
 
-    # Если пользователь уже потратил карту
     if balance == 0:
-
-        await message.answer(
-            "✨ У вас сейчас нет доступных карт.\n\n"
-            "Вы можете приобрести дополнительные:",
-            reply_markup=get_tariffs_keyboard(),
-        )
+        await send_tariffs(message)
 
 
 # =========================================================
-# МОЙ БАЛАНС
+# БАЛАНС
 # =========================================================
 
 @dp.message(F.text == "💰 Мой баланс")
 async def balance_handler(message: Message):
-
     balance = await get_balance(
         message.from_user.id
     )
 
-    if balance > 0:
+    await message.answer(
+        f"💫 Ваш баланс: {balance} карт."
+    )
 
-        await message.answer(
-            f"💰 Ваш баланс: {balance} карт."
-        )
-
-    else:
-
-        await message.answer(
-            "💰 Ваш баланс: 0 карт.\n\n"
-            "✨ Хотите получить дополнительные карты?",
-            reply_markup=get_tariffs_keyboard(),
-        )
+    if balance == 0:
+        await send_tariffs(message)
 
 
 # =========================================================
 # СЛУЧАЙНАЯ КАРТА
 # =========================================================
 
-@dp.message(F.text == "🎴 Выбрать случайную карту")
+@dp.message(
+    F.text == "🎴 Выбрать случайную карту"
+)
 async def random_card_handler(message: Message):
-
     balance = await get_balance(
         message.from_user.id
     )
 
     if balance <= 0:
-
         await message.answer(
-            "✨ У вас закончились доступные карты.\n\n"
-            "Выберите пакет:",
-            reply_markup=get_tariffs_keyboard(),
+            "У вас закончились доступные карты."
         )
+
+        await send_tariffs(message)
 
         return
 
     card_number = secrets.randbelow(45) + 1
 
     await send_card(
-        message=message,
-        card_number=card_number,
+        message,
+        card_number,
     )
 
 
@@ -437,196 +529,182 @@ async def random_card_handler(message: Message):
 # ВЫБОР КАРТЫ ПО НОМЕРУ
 # =========================================================
 
-@dp.message(F.text == "🔢 Выбрать карту по номеру")
-async def choose_number_handler(message: Message):
-
+@dp.message(
+    F.text == "🔢 Выбрать карту по номеру"
+)
+async def choose_card_handler(message: Message):
     balance = await get_balance(
         message.from_user.id
     )
 
     if balance <= 0:
-
         await message.answer(
-            "✨ У вас закончились доступные карты.\n\n"
-            "Выберите пакет:",
-            reply_markup=get_tariffs_keyboard(),
+            "У вас закончились доступные карты."
         )
+
+        await send_tariffs(message)
 
         return
 
     await message.answer(
-        "🔢 Введите номер карты от 1 до 45:"
+        "Введите номер карты от 1 до 45:"
     )
 
 
 # =========================================================
-# КНОПКА ГЛАВНОГО МЕНЮ "ХОЧУ БОЛЬШЕ КАРТ"
+# КНОПКА "ХОЧУ БОЛЬШЕ КАРТ"
 # =========================================================
 
-@dp.message(F.text == "✨ Хочу больше карт")
-async def more_cards_handler(message: Message):
-
+@dp.message(
+    F.text == "✨ Хочу больше карт"
+)
+async def buy_more_handler(message: Message):
     await send_tariffs(message)
 
 
 # =========================================================
-# INLINE-КНОПКА "ХОЧУ БОЛЬШЕ КАРТ"
+# INLINE-КНОПКА ТАРИФОВ
 # =========================================================
 
-@dp.callback_query(F.data == "show_tariffs")
-async def show_tariffs_handler(
+@dp.callback_query(
+    F.data == "show_tariffs"
+)
+async def show_tariffs_callback(
     callback: CallbackQuery,
 ):
-
-    await callback.message.answer(
-        "✨ Выберите пакет дополнительных карт:\n\n"
-        "🎴 1 карта — 50 ₽\n"
-        "🎴 3 карты — 120 ₽\n"
-        "🎴 5 карт — 180 ₽\n\n"
-        "Сейчас используется демонстрационная оплата.",
-        reply_markup=get_tariffs_keyboard(),
-    )
-
     await callback.answer()
+
+    if callback.message:
+        await send_tariffs(
+            callback.message
+        )
 
 
 # =========================================================
 # ВЫБОР ТАРИФА
 # =========================================================
 
-@dp.callback_query(F.data.startswith("tariff_"))
-async def tariff_handler(
+@dp.callback_query(
+    F.data.startswith("tariff_")
+)
+async def tariff_callback(
     callback: CallbackQuery,
 ):
+    await callback.answer()
 
-    tariff_id = callback.data.split("_")[1]
+    tariff_key = callback.data.replace(
+        "tariff_",
+        "",
+        1,
+    )
 
-    tariff = tariffs.get(tariff_id)
-
-    if not tariff:
-
-        await callback.answer(
-            "Тариф не найден."
-        )
-
+    if tariff_key not in tariffs:
         return
 
-    cards_amount = tariff["cards"]
-    price = tariff["price"]
+    tariff = tariffs[tariff_key]
 
-    payment_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"💳 Оплатить {price} ₽ (ДЕМО)",
-                    callback_data=f"pay_{tariff_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад к тарифам",
-                    callback_data="back_to_tariffs",
-                )
-            ],
-        ]
-    )
+    if not callback.message:
+        return
 
     await callback.message.edit_text(
-        "🎴 Вы выбрали пакет:\n\n"
-        f"Количество карт: {cards_amount}\n"
-        f"Стоимость: {price} ₽\n\n"
-        "Для демонстрации нажмите кнопку оплаты.\n\n"
-        "⚠️ Настоящие деньги списываться не будут.",
-        reply_markup=payment_keyboard,
+        "✨ Вы выбрали:\n\n"
+        f"🎴 Карт: {tariff['cards']}\n"
+        f"💳 Стоимость: {tariff['price']} ₽\n\n"
+        "Сейчас используется тестовая "
+        "демо-оплата.",
+        reply_markup=get_payment_keyboard(
+            tariff_key
+        ),
     )
-
-    await callback.answer()
 
 
 # =========================================================
 # НАЗАД К ТАРИФАМ
 # =========================================================
 
-@dp.callback_query(F.data == "back_to_tariffs")
-async def back_to_tariffs_handler(
+@dp.callback_query(
+    F.data == "back_to_tariffs"
+)
+async def back_to_tariffs_callback(
     callback: CallbackQuery,
 ):
+    await callback.answer()
+
+    if not callback.message:
+        return
 
     await callback.message.edit_text(
-        "✨ Выберите пакет дополнительных карт:\n\n"
-        "🎴 1 карта — 50 ₽\n"
-        "🎴 3 карты — 120 ₽\n"
-        "🎴 5 карт — 180 ₽\n\n"
-        "Сейчас используется демонстрационная оплата.",
+        "✨ Выберите подходящий вариант:",
         reply_markup=get_tariffs_keyboard(),
     )
-
-    await callback.answer()
 
 
 # =========================================================
 # ДЕМО-ОПЛАТА
 # =========================================================
 
-@dp.callback_query(F.data.startswith("pay_"))
-async def payment_handler(
+@dp.callback_query(
+    F.data.startswith("pay_")
+)
+async def payment_callback(
     callback: CallbackQuery,
 ):
+    tariff_key = callback.data.replace(
+        "pay_",
+        "",
+        1,
+    )
 
-    tariff_id = callback.data.split("_")[1]
-
-    tariff = tariffs.get(tariff_id)
-
-    if not tariff:
-
+    if tariff_key not in tariffs:
         await callback.answer(
-            "Ошибка оплаты."
+            "Неизвестный тариф.",
+            show_alert=True,
         )
 
         return
 
-    cards_amount = tariff["cards"]
-    price = tariff["price"]
+    tariff = tariffs[tariff_key]
 
     user_id = callback.from_user.id
 
-    # ДЕМО:
-    # реальной оплаты здесь пока нет.
-    # Просто начисляем выбранное количество карт.
     await add_cards(
-        user_id=user_id,
-        amount=cards_amount,
+        user_id,
+        tariff["cards"],
     )
 
-    balance = await get_balance(user_id)
-
-    await callback.message.edit_text(
-        "✅ ДЕМО-ОПЛАТА УСПЕШНА\n\n"
-        f"💳 Сумма: {price} ₽\n"
-        f"🎴 Начислено карт: {cards_amount}\n\n"
-        f"💰 Теперь доступно карт: {balance}\n\n"
-        "Можете продолжить выбирать карты 👇"
+    new_balance = await get_balance(
+        user_id
     )
 
     await callback.answer(
-        "Карты начислены!"
+        "Демо-оплата прошла успешно!"
+    )
+
+    if not callback.message:
+        return
+
+    await callback.message.edit_text(
+        "✅ ДЕМО-ОПЛАТА УСПЕШНА\n\n"
+        f"Начислено карт: {tariff['cards']}\n"
+        f"💫 Новый баланс: {new_balance}\n\n"
+        "Теперь можно открыть карту."
     )
 
 
 # =========================================================
-# ОБРАБОТКА НОМЕРОВ 1–45
+# ВВОД НОМЕРА 1–45
 # =========================================================
 
 @dp.message(F.text.regexp(r"^\d+$"))
 async def number_handler(message: Message):
+    try:
+        card_number = int(message.text)
+    except (TypeError, ValueError):
+        return
 
-    number = int(message.text)
-
-    if not 1 <= number <= 45:
-
+    if not 1 <= card_number <= 45:
         await message.answer(
-            "❌ Такой карты нет.\n\n"
-            "Введите номер от 1 до 45."
+            "Введите номер карты от 1 до 45."
         )
 
         return
@@ -636,18 +714,17 @@ async def number_handler(message: Message):
     )
 
     if balance <= 0:
-
         await message.answer(
-            "✨ У вас закончились доступные карты.\n\n"
-            "Выберите пакет:",
-            reply_markup=get_tariffs_keyboard(),
+            "У вас закончились доступные карты."
         )
+
+        await send_tariffs(message)
 
         return
 
     await send_card(
-        message=message,
-        card_number=number,
+        message,
+        card_number,
     )
 
 
@@ -656,29 +733,37 @@ async def number_handler(message: Message):
 # =========================================================
 
 @dp.message()
-async def other_message_handler(message: Message):
-
+async def fallback_handler(message: Message):
     await message.answer(
-        "Пожалуйста, воспользуйтесь кнопками меню 👇",
+        "Выберите действие с помощью кнопок ниже.",
         reply_markup=main_keyboard,
     )
 
 
 # =========================================================
-# ЗАПУСК БОТА
+# ЗАПУСК
 # =========================================================
 
 async def main():
+    logging.basicConfig(
+        level=logging.INFO
+    )
 
     await init_db()
 
-    me = await bot.get_me()
+    bot = Bot(token=TOKEN)
 
-    print(f"Подключение успешно: @{me.username}")
-    print("База данных подключена.")
-    print("Бот запущен и ждёт сообщения...")
+    bot_info = await bot.get_me()
 
-    await dp.start_polling(bot)
+    logging.info(
+        "Бот запущен: @%s",
+        bot_info.username,
+    )
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
