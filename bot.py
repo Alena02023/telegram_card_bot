@@ -39,6 +39,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DATABASE = BASE_DIR / "bot_demo_clean.db"
 
 CARDS_FILE = BASE_DIR / "cards.json"
+WELCOME_VIDEO_1 = BASE_DIR / "media" / "welcome_video_1.mp4"
+WELCOME_VIDEO_2 = BASE_DIR / "media" / "welcome_video_2.mp4"
 
 
 # =========================================================
@@ -96,12 +98,12 @@ main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
             KeyboardButton(
-                text="🎴 Выбрать случайную карту"
+                text="✨ Получить случайным образом"
             )
         ],
         [
             KeyboardButton(
-                text="🔢 Выбрать карту по номеру"
+                text="🔢 Выбрать карту самой"
             )
         ],
         [
@@ -117,6 +119,17 @@ main_keyboard = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+
+
+def get_ready_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="✨ Готовы?",
+                callback_data="welcome_ready",
+            )
+        ]]
+    )
 
 
 def get_tariffs_keyboard():
@@ -192,6 +205,14 @@ async def init_db():
             )
             """
         )
+
+        # Для существующей базы добавляем отметку о прохождении приветствия.
+        cursor = await db.execute("PRAGMA table_info(users)")
+        columns = [row[1] for row in await cursor.fetchall()]
+        if "intro_seen" not in columns:
+            await db.execute(
+                "ALTER TABLE users ADD COLUMN intro_seen INTEGER NOT NULL DEFAULT 0"
+            )
 
         await db.commit()
 
@@ -279,6 +300,27 @@ async def use_card(user_id: int) -> bool:
         await db.commit()
 
         return cursor.rowcount > 0
+
+
+async def has_seen_intro(user_id: int) -> bool:
+    await create_user(user_id)
+    async with aiosqlite.connect(DATABASE) as db:
+        cursor = await db.execute(
+            "SELECT intro_seen FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+    return bool(row and row[0])
+
+
+async def mark_intro_seen(user_id: int):
+    await create_user(user_id)
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute(
+            "UPDATE users SET intro_seen = 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        await db.commit()
 
 
 # =========================================================
@@ -460,22 +502,116 @@ dp = Dispatcher()
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     user_id = message.from_user.id
-
     await create_user(user_id)
 
-    balance = await get_balance(user_id)
+    if await has_seen_intro(user_id):
+        balance = await get_balance(user_id)
+        await message.answer(
+            "✨ С возвращением в «Следы праматери».\n\n"
+            f"💫 Доступно карт: {balance}",
+            reply_markup=main_keyboard,
+        )
+        if balance == 0:
+            await send_tariffs(message)
+        return
+
+    if not WELCOME_VIDEO_1.exists() or not WELCOME_VIDEO_2.exists():
+        logging.error("Не найдены приветственные видео в папке media")
+        await message.answer(
+            "Не удалось загрузить приветственное видео. Попробуйте чуть позже."
+        )
+        return
+
+    await message.answer_video(video=FSInputFile(WELCOME_VIDEO_1))
 
     await message.answer(
-        "✨ Добро пожаловать в «Следы праматери».\n\n"
-        "Вы можете довериться случаю и получить "
-        "случайную карту или выбрать карту "
-        "по номеру от 1 до 45.\n\n"
-        f"💫 Доступно карт: {balance}",
-        reply_markup=main_keyboard,
+        "🦋Привет,моя дорогая!\n"
+        "Ты здесь совершенно неслучайно 💫\n\n"
+        "У тебя есть уникальная возможность почувствовать и узнать, "
+        "как звучит магия ✨ (из описания карт, надеюсь вы тоже "
+        "почувствуете, какое это таинство)"
     )
 
-    if balance == 0:
-        await send_tariffs(message)
+    await message.answer(
+        "Давным-давно, когда мир был моложе, чем теперь, люди вырезали "
+        "из дерева и костей фигурки Великой Матери. Они чтили её как ту, "
+        "что всегда заботится о своих детях, дающую жизнь, повелевающую "
+        "миром людей и миром духов.\n"
+        "У этих фигурок не было лиц, потому что люди знали - лик Матери "
+        "непостижим. Его хранит в себе каждое женское лицо из всех "
+        "существовавших и существующих. Она - первозданная сила и жизнь, "
+        "она - проводник в мир тайн, она - дарующая урожай.\n\n"
+        "Эта колода создана для женщин, которые находятся в печали, "
+        "в сомнении, в поиске, в периоде трансформации, нуждаются в совете "
+        "от самой Мудрой, в её помощи и заботе."
+    )
+
+    await message.answer(
+        "Карты могут работать как оракул, но в первую очередь, "
+        "«Следы Праматери» - колода, исцеляющая женское сердце. "
+        "Старшая подруга, мать, бабушка, сестра, которая выслушает, "
+        "даст хороший совет, поддержит. Где-то покажет то, что сейчас "
+        "вы не хотите видеть или отрицаете, где-то подсветит иллюзии "
+        "и поможет от них отказаться."
+    )
+
+    await message.answer(
+        "Ей ведома земля и небо, звезды и моря, животные и птицы, "
+        "растения и рыбы. Всем этим она повелевает, и все это готова вам "
+        "подарить. Колода состоит из 45 карт с женскими изображениями "
+        "без лица. Работая с ней, помните, что она показывает сейчас "
+        "ваше лицо, ваше состояние."
+    )
+
+    await message.answer(
+        "Еще чуть-чуть важной информации\n"
+        "Вытягивая карту, вы получаете точное описание, что происходит, "
+        "что делать, а также совет карт.\n\n"
+        "👆Но главное, к каждой карте есть аффирмация, которую нужно "
+        "повторять или писать 7 дней, что в разы усиливает энергию карты "
+        "и буквально запускает новые процессы, вам нужно лишь быть "
+        "внимательными и наблюдать, какие чудеса будут происходить, "
+        "как будет решаться ваш запрос.\n\n"
+        "p.s. можете скачать карту и поставить на заставку для усиления эффекта"
+    )
+
+    await message.answer_video(
+        video=FSInputFile(WELCOME_VIDEO_2),
+        reply_markup=get_ready_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "welcome_ready")
+async def welcome_ready_callback(callback: CallbackQuery):
+    await callback.answer()
+    await mark_intro_seen(callback.from_user.id)
+
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        await callback.message.answer(
+            "☀️Обращаемся к шаманским картам за подсказкой, инструкция по применению:\n"
+            "1️⃣  Загадайте ваше желание и задайте вопрос в формате: "
+            "«Что мне нужно сделать, чтобы... (добавьте своё)».\n"
+            "2️⃣Выберите один из двух способов получения подсказки от карт:\n"
+            "- Нажмите «Выбрать карту самой» сделайте глубокий вдох-выдох, "
+            "закройте глазки, выберите номер карты от 1 до 45 и введите его "
+            "в окошко, наслаждайтесь расшифровкой и советом карт🍀\n"
+            "- Нажмите «Получить случайным образом» сделайте глубокий "
+            "вдох-выдох, проговорите свой запрос, нажмите на кнопку и получите "
+            "случайным образом карту, наслаждайтесь расшифровкой и советом карт🍀\n"
+            "Приготовьтесь, ваш совет от карт уже в пути.",
+            reply_markup=main_keyboard,
+        )
+
+        balance = await get_balance(callback.from_user.id)
+        await callback.message.answer(f"💫 Доступно карт: {balance}")
+
+        if balance == 0:
+            await send_tariffs(callback.message)
 
 
 # =========================================================
@@ -501,7 +637,7 @@ async def balance_handler(message: Message):
 # =========================================================
 
 @dp.message(
-    F.text == "🎴 Выбрать случайную карту"
+    F.text == "✨ Получить случайным образом"
 )
 async def random_card_handler(message: Message):
     balance = await get_balance(
@@ -530,7 +666,7 @@ async def random_card_handler(message: Message):
 # =========================================================
 
 @dp.message(
-    F.text == "🔢 Выбрать карту по номеру"
+    F.text == "🔢 Выбрать карту самой"
 )
 async def choose_card_handler(message: Message):
     balance = await get_balance(
