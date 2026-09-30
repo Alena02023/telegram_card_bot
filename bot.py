@@ -3,9 +3,11 @@ import json
 import logging
 import os
 import secrets
+import uuid
 from pathlib import Path
 
 import asyncpg
+from aiohttp import web, ClientSession, BasicAuth
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
@@ -35,13 +37,20 @@ if not TOKEN:
 BASE_DIR = Path(__file__).resolve().parent
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY")
+PORT = int(os.getenv("PORT", "8080"))
+PUBLIC_BASE_URL = "https://devoted-wisdom-production-a9fd.up.railway.app"
+RETURN_URL = f"{PUBLIC_BASE_URL}/payment/return"
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL не найден в переменных окружения")
+if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+    raise ValueError("Не найдены переменные YooKassa")
 
 CARDS_FILE = BASE_DIR / "cards.json"
-WELCOME_VIDEO_1 = BASE_DIR / "media" / "welcome_video_1.mp4"
-WELCOME_VIDEO_2 = BASE_DIR / "media" / "welcome_video_2.mp4"
+WELCOME_VIDEO_1 = BASE_DIR / "media" / "welcome_video_2.mp4"
+WELCOME_VIDEO_2 = BASE_DIR / "media" / "welcome_video_1.mp4"
 
 
 # =========================================================
@@ -76,18 +85,10 @@ if set(cards.keys()) != set(range(1, 46)):
 # =========================================================
 
 tariffs = {
-    "1": {
-        "cards": 1,
-        "price": 50,
-    },
-    "3": {
-        "cards": 3,
-        "price": 120,
-    },
-    "5": {
-        "cards": 5,
-        "price": 180,
-    },
+    "1": {"requests": 1, "price": 100, "label": "1 запрос — 100 ₽"},
+    "20": {"requests": 20, "price": 1500, "label": "20 запросов — 1 500 ₽"},
+    "100": {"requests": 100, "price": 7000, "label": "100 запросов — 7 000 ₽"},
+    "unlimited": {"requests": None, "price": 10000, "label": "Безлимит — 10 000 ₽"},
 }
 
 
@@ -113,9 +114,10 @@ main_keyboard = ReplyKeyboardMarkup(
             )
         ],
         [
-            KeyboardButton(
-                text="✨ Хочу больше карт"
-            )
+            KeyboardButton(text="✨ Хочу больше запросов")
+        ],
+        [
+            KeyboardButton(text="💬 Личная консультация")
         ],
     ],
     resize_keyboard=True,
@@ -136,59 +138,33 @@ def get_ready_keyboard():
 def get_tariffs_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="1 карта — 50 ₽",
-                    callback_data="tariff_1",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="3 карты — 120 ₽",
-                    callback_data="tariff_3",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="5 карт — 180 ₽",
-                    callback_data="tariff_5",
-                )
-            ],
+            [InlineKeyboardButton(text=tariffs["1"]["label"], callback_data="tariff_1")],
+            [InlineKeyboardButton(text=tariffs["20"]["label"], callback_data="tariff_20")],
+            [InlineKeyboardButton(text=tariffs["100"]["label"], callback_data="tariff_100")],
+            [InlineKeyboardButton(text=tariffs["unlimited"]["label"], callback_data="tariff_unlimited")],
         ]
     )
 
 
 def get_buy_keyboard():
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✨ Хочу больше карт",
-                    callback_data="show_tariffs",
-                )
-            ]
-        ]
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="✨ Хочу больше запросов",
+                callback_data="show_tariffs",
+            )
+        ]]
     )
 
 
-def get_payment_keyboard(tariff_key: str):
-    tariff = tariffs[tariff_key]
-
+def get_consultation_keyboard():
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"💳 Оплатить {tariff['price']} ₽",
-                    callback_data=f"pay_{tariff_key}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="← Назад к тарифам",
-                    callback_data="back_to_tariffs",
-                )
-            ],
-        ]
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="💬 Написать для консультации",
+                url="https://t.me/astro_prave",
+            )
+        ]]
     )
 
 
@@ -205,6 +181,22 @@ async def init_db():
                 user_id BIGINT PRIMARY KEY,
                 balance INTEGER NOT NULL DEFAULT 1,
                 intro_seen BOOLEAN NOT NULL DEFAULT FALSE
+            )
+            """
+        )
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS unlimited BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payments (
+                payment_id TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                tariff_key TEXT NOT NULL,
+                amount_kopecks INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                paid_at TIMESTAMPTZ
             )
             """
         )
@@ -246,6 +238,19 @@ async def get_balance(user_id: int) -> int:
     return int(balance or 0)
 
 
+async def get_access(user_id: int):
+    await create_user(user_id)
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        row = await conn.fetchrow(
+            "SELECT balance, unlimited FROM users WHERE user_id = $1",
+            user_id,
+        )
+        return int(row["balance"] or 0), bool(row["unlimited"])
+    finally:
+        await conn.close()
+
+
 async def add_cards(user_id: int, amount: int):
     await create_user(user_id)
 
@@ -265,27 +270,26 @@ async def add_cards(user_id: int, amount: int):
 
 
 async def use_card(user_id: int) -> bool:
-    """
-    Атомарно списывает одну карту,
-    только если баланс больше нуля.
-    """
+    """Списывает один запрос; при безлимите ничего не списывает."""
     await create_user(user_id)
-
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        result = await conn.execute(
-            """
-            UPDATE users
-            SET balance = balance - 1
-            WHERE user_id = $1
-              AND balance > 0
-            """,
-            user_id,
-        )
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT balance, unlimited FROM users WHERE user_id = $1 FOR UPDATE",
+                user_id,
+            )
+            if row["unlimited"]:
+                return True
+            if row["balance"] <= 0:
+                return False
+            await conn.execute(
+                "UPDATE users SET balance = balance - 1 WHERE user_id = $1",
+                user_id,
+            )
+            return True
     finally:
         await conn.close()
-
-    return result == "UPDATE 1"
 
 
 async def has_seen_intro(user_id: int) -> bool:
@@ -322,6 +326,139 @@ async def mark_intro_seen(user_id: int):
         )
     finally:
         await conn.close()
+
+
+# =========================================================
+# YOOKASSA
+# =========================================================
+
+async def create_yookassa_payment(user_id: int, tariff_key: str):
+    tariff = tariffs[tariff_key]
+    payload = {
+        "amount": {"value": f"{tariff['price']:.2f}", "currency": "RUB"},
+        "payment_method_data": {"type": "sbp"},
+        "confirmation": {"type": "redirect", "return_url": RETURN_URL},
+        "capture": True,
+        "description": f"Следы праматери: {tariff['label']}",
+        "metadata": {
+            "telegram_user_id": str(user_id),
+            "tariff_key": tariff_key,
+        },
+    }
+    auth = BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
+    async with ClientSession(auth=auth) as session:
+        async with session.post(
+            "https://api.yookassa.ru/v3/payments",
+            json=payload,
+            headers={"Idempotence-Key": str(uuid.uuid4())},
+        ) as response:
+            data = await response.json()
+            if response.status not in (200, 201):
+                raise RuntimeError(f"YooKassa: {response.status} {data}")
+
+    payment_id = data["id"]
+    confirmation_url = data.get("confirmation", {}).get("confirmation_url")
+    if not confirmation_url:
+        raise RuntimeError("YooKassa не вернула ссылку оплаты")
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute(
+            """INSERT INTO payments(payment_id,user_id,tariff_key,amount_kopecks,status)
+               VALUES($1,$2,$3,$4,'pending') ON CONFLICT(payment_id) DO NOTHING""",
+            payment_id, user_id, tariff_key, tariff["price"] * 100,
+        )
+    finally:
+        await conn.close()
+    return confirmation_url
+
+
+async def fetch_yookassa_payment(payment_id: str):
+    auth = BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
+    async with ClientSession(auth=auth) as session:
+        async with session.get(
+            f"https://api.yookassa.ru/v3/payments/{payment_id}"
+        ) as response:
+            data = await response.json()
+            if response.status != 200:
+                raise RuntimeError(f"YooKassa GET: {response.status} {data}")
+            return data
+
+
+async def apply_successful_payment(payment_id: str):
+    payment = await fetch_yookassa_payment(payment_id)
+    if payment.get("status") != "succeeded" or not payment.get("paid"):
+        return None
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT * FROM payments WHERE payment_id=$1 FOR UPDATE", payment_id
+            )
+            if not row or row["status"] == "succeeded":
+                return None
+
+            tariff_key = row["tariff_key"]
+            tariff = tariffs.get(tariff_key)
+            if not tariff:
+                raise RuntimeError("Неизвестный тариф")
+
+            amount = payment.get("amount", {})
+            metadata = payment.get("metadata", {})
+            if amount.get("currency") != "RUB":
+                raise RuntimeError("Неверная валюта")
+            if amount.get("value") != f"{row['amount_kopecks']/100:.2f}":
+                raise RuntimeError("Неверная сумма")
+            if str(metadata.get("telegram_user_id")) != str(row["user_id"]):
+                raise RuntimeError("Неверный пользователь")
+            if metadata.get("tariff_key") != tariff_key:
+                raise RuntimeError("Неверный тариф")
+
+            if tariff_key == "unlimited":
+                await conn.execute(
+                    "UPDATE users SET unlimited=TRUE WHERE user_id=$1", row["user_id"]
+                )
+            else:
+                await conn.execute(
+                    "UPDATE users SET balance=balance+$1 WHERE user_id=$2",
+                    tariff["requests"], row["user_id"]
+                )
+            await conn.execute(
+                "UPDATE payments SET status='succeeded', paid_at=NOW() WHERE payment_id=$1",
+                payment_id,
+            )
+            return int(row["user_id"]), tariff_key
+    finally:
+        await conn.close()
+
+
+async def yookassa_webhook(request: web.Request):
+    bot = request.app["bot"]
+    try:
+        data = await request.json()
+        if data.get("event") != "payment.succeeded":
+            return web.Response(status=200)
+        payment_id = data.get("object", {}).get("id")
+        if not payment_id:
+            return web.Response(status=200)
+
+        result = await apply_successful_payment(payment_id)
+        if result:
+            user_id, tariff_key = result
+            if tariff_key == "unlimited":
+                msg = "✅ Оплата прошла успешно!\n\n♾ Вам открыт безлимитный доступ."
+            else:
+                msg = f"✅ Оплата прошла успешно!\n\n💫 Начислено запросов: {tariffs[tariff_key]['requests']}."
+            await bot.send_message(user_id, msg, reply_markup=main_keyboard)
+        return web.Response(status=200)
+    except Exception:
+        logging.exception("Ошибка webhook YooKassa")
+        return web.Response(status=500)
+
+
+async def payment_return(request: web.Request):
+    raise web.HTTPFound("https://t.me/Shaman_karta_bot")
 
 
 # =========================================================
@@ -406,7 +543,7 @@ def split_long_text(
 
 async def send_tariffs(message: Message):
     await message.answer(
-        "✨ Хотите открыть ещё карты?\n\n"
+        "✨ Хотите получить ещё запросы?\n\n"
         "Выберите подходящий вариант:",
         reply_markup=get_tariffs_keyboard(),
     )
@@ -426,7 +563,7 @@ async def send_card(
 
     if not success:
         await message.answer(
-            "У вас закончились доступные карты."
+            "У вас закончились доступные запросы."
         )
 
         await send_tariffs(message)
@@ -474,17 +611,15 @@ async def send_card(
     for part in text_parts:
         await message.answer(part)
 
-    balance = await get_balance(user_id)
+    balance, unlimited = await get_access(user_id)
 
-    if balance > 0:
-        await message.answer(
-            f"💫 Осталось карт: {balance}"
-        )
-
+    if unlimited:
+        await message.answer("♾ У вас безлимитный доступ.")
+    elif balance > 0:
+        await message.answer(f"💫 Осталось запросов: {balance}")
     else:
         await message.answer(
-            "Это была ваша последняя доступная карта.\n\n"
-            "Хотите открыть ещё?",
+            "Это был ваш последний доступный запрос.\n\nХотите получить ещё?",
             reply_markup=get_buy_keyboard(),
         )
 
@@ -506,13 +641,13 @@ async def start_handler(message: Message):
     await create_user(user_id)
 
     if await has_seen_intro(user_id):
-        balance = await get_balance(user_id)
+        balance, unlimited = await get_access(user_id)
+        access_text = "♾ Безлимит" if unlimited else f"💫 Доступно запросов: {balance}"
         await message.answer(
-            "✨ С возвращением в «Следы праматери».\n\n"
-            f"💫 Доступно карт: {balance}",
+            "✨ С возвращением в «Следы праматери».\n\n" + access_text,
             reply_markup=main_keyboard,
         )
-        if balance == 0:
+        if not unlimited and balance == 0:
             await send_tariffs(message)
         return
 
@@ -608,11 +743,13 @@ async def welcome_ready_callback(callback: CallbackQuery):
             reply_markup=main_keyboard,
         )
 
-        balance = await get_balance(callback.from_user.id)
-        await callback.message.answer(f"💫 Доступно карт: {balance}")
-
-        if balance == 0:
-            await send_tariffs(callback.message)
+        balance, unlimited = await get_access(callback.from_user.id)
+        if unlimited:
+            await callback.message.answer("♾ У вас безлимитный доступ.")
+        else:
+            await callback.message.answer(f"💫 Доступно запросов: {balance}")
+            if balance == 0:
+                await send_tariffs(callback.message)
 
 
 # =========================================================
@@ -621,16 +758,13 @@ async def welcome_ready_callback(callback: CallbackQuery):
 
 @dp.message(F.text == "💰 Мой баланс")
 async def balance_handler(message: Message):
-    balance = await get_balance(
-        message.from_user.id
-    )
-
-    await message.answer(
-        f"💫 Ваш баланс: {balance} карт."
-    )
-
-    if balance == 0:
-        await send_tariffs(message)
+    balance, unlimited = await get_access(message.from_user.id)
+    if unlimited:
+        await message.answer("♾ Ваш доступ: Безлимит.")
+    else:
+        await message.answer(f"💫 Ваш баланс: {balance} запросов.")
+        if balance == 0:
+            await send_tariffs(message)
 
 
 # =========================================================
@@ -641,13 +775,13 @@ async def balance_handler(message: Message):
     F.text == "✨ Получить случайным образом"
 )
 async def random_card_handler(message: Message):
-    balance = await get_balance(
+    balance, unlimited = await get_access(
         message.from_user.id
     )
 
-    if balance <= 0:
+    if not unlimited and balance <= 0:
         await message.answer(
-            "У вас закончились доступные карты."
+            "У вас закончились доступные запросы."
         )
 
         await send_tariffs(message)
@@ -670,13 +804,13 @@ async def random_card_handler(message: Message):
     F.text == "🔢 Выбрать карту самой"
 )
 async def choose_card_handler(message: Message):
-    balance = await get_balance(
+    balance, unlimited = await get_access(
         message.from_user.id
     )
 
-    if balance <= 0:
+    if not unlimited and balance <= 0:
         await message.answer(
-            "У вас закончились доступные карты."
+            "У вас закончились доступные запросы."
         )
 
         await send_tariffs(message)
@@ -693,7 +827,7 @@ async def choose_card_handler(message: Message):
 # =========================================================
 
 @dp.message(
-    F.text == "✨ Хочу больше карт"
+    F.text == "✨ Хочу больше запросов"
 )
 async def buy_more_handler(message: Message):
     await send_tariffs(message)
@@ -721,115 +855,49 @@ async def show_tariffs_callback(
 # ВЫБОР ТАРИФА
 # =========================================================
 
-@dp.callback_query(
-    F.data.startswith("tariff_")
-)
-async def tariff_callback(
-    callback: CallbackQuery,
-):
+@dp.callback_query(F.data.startswith("tariff_"))
+async def tariff_callback(callback: CallbackQuery):
     await callback.answer()
-
-    tariff_key = callback.data.replace(
-        "tariff_",
-        "",
-        1,
-    )
-
-    if tariff_key not in tariffs:
+    tariff_key = callback.data.replace("tariff_", "", 1)
+    if tariff_key not in tariffs or not callback.message:
         return
-
     tariff = tariffs[tariff_key]
-
-    if not callback.message:
+    try:
+        url = await create_yookassa_payment(callback.from_user.id, tariff_key)
+    except Exception:
+        logging.exception("Ошибка создания платежа")
+        await callback.message.answer("Не удалось создать платёж. Попробуйте немного позже.")
         return
 
     await callback.message.edit_text(
         "✨ Вы выбрали:\n\n"
-        f"🎴 Карт: {tariff['cards']}\n"
-        f"💳 Стоимость: {tariff['price']} ₽\n\n"
-        "Сейчас используется тестовая "
-        "демо-оплата.",
-        reply_markup=get_payment_keyboard(
-            tariff_key
+        f"{tariff['label']}\n\n"
+        "Нажмите кнопку ниже для оплаты через СБП.\n"
+        "Доступ будет начислен автоматически после подтверждения оплаты.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"💳 Оплатить {tariff['price']} ₽", url=url)],
+                [InlineKeyboardButton(text="← Назад к тарифам", callback_data="back_to_tariffs")],
+            ]
         ),
     )
 
 
-# =========================================================
-# НАЗАД К ТАРИФАМ
-# =========================================================
-
-@dp.callback_query(
-    F.data == "back_to_tariffs"
-)
-async def back_to_tariffs_callback(
-    callback: CallbackQuery,
-):
+@dp.callback_query(F.data == "back_to_tariffs")
+async def back_to_tariffs_callback(callback: CallbackQuery):
     await callback.answer()
-
-    if not callback.message:
-        return
-
-    await callback.message.edit_text(
-        "✨ Выберите подходящий вариант:",
-        reply_markup=get_tariffs_keyboard(),
-    )
-
-
-# =========================================================
-# ДЕМО-ОПЛАТА
-# =========================================================
-
-@dp.callback_query(
-    F.data.startswith("pay_")
-)
-async def payment_callback(
-    callback: CallbackQuery,
-):
-    tariff_key = callback.data.replace(
-        "pay_",
-        "",
-        1,
-    )
-
-    if tariff_key not in tariffs:
-        await callback.answer(
-            "Неизвестный тариф.",
-            show_alert=True,
+    if callback.message:
+        await callback.message.edit_text(
+            "✨ Выберите подходящий вариант:",
+            reply_markup=get_tariffs_keyboard(),
         )
 
-        return
 
-    tariff = tariffs[tariff_key]
-
-    user_id = callback.from_user.id
-
-    await add_cards(
-        user_id,
-        tariff["cards"],
-    )
-
-    new_balance = await get_balance(
-        user_id
-    )
-
-    await callback.answer(
-        "Демо-оплата прошла успешно!"
-    )
-
-    if not callback.message:
-        return
-
-    await callback.message.edit_text(
-        "✅ ДЕМО-ОПЛАТА УСПЕШНА\n\n"
-        f"Начислено карт: {tariff['cards']}\n"
-        f"💫 Новый баланс: {new_balance}\n\n"
-        "Теперь можно открыть карту."
-    )
-
-    await callback.message.answer(
-        "Выберите, как хотите получить подсказку:",
-        reply_markup=main_keyboard,
+@dp.message(F.text == "💬 Личная консультация")
+async def consultation_handler(message: Message):
+    await message.answer(
+        "💬 Для личной консультации напишите @astro_prave",
+        reply_markup=get_consultation_keyboard(),
     )
 
 
@@ -851,13 +919,13 @@ async def number_handler(message: Message):
 
         return
 
-    balance = await get_balance(
+    balance, unlimited = await get_access(
         message.from_user.id
     )
 
-    if balance <= 0:
+    if not unlimited and balance <= 0:
         await message.answer(
-            "У вас закончились доступные карты."
+            "У вас закончились доступные запросы."
         )
 
         await send_tariffs(message)
@@ -887,24 +955,28 @@ async def fallback_handler(message: Message):
 # =========================================================
 
 async def main():
-    logging.basicConfig(
-        level=logging.INFO
-    )
-
+    logging.basicConfig(level=logging.INFO)
     await init_db()
 
     bot = Bot(token=TOKEN)
-
     bot_info = await bot.get_me()
+    logging.info("Бот запущен: @%s", bot_info.username)
 
-    logging.info(
-        "Бот запущен: @%s",
-        bot_info.username,
-    )
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_post("/yookassa/webhook", yookassa_webhook)
+    app.router.add_get("/payment/return", payment_return)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info("HTTP-сервер запущен на порту %s", PORT)
 
     try:
         await dp.start_polling(bot)
     finally:
+        await runner.cleanup()
         await bot.session.close()
 
 
