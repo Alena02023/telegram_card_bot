@@ -454,11 +454,27 @@ async def yookassa_webhook(request: web.Request):
 
 
 async def notify_successful_payment(bot: Bot, user_id: int, tariff_key: str):
+    """Сообщает об оплате и сразу возвращает пользователя к выбору карты."""
     if tariff_key == "unlimited":
-        msg = "✅ Оплата прошла успешно!\n\n♾ Вам открыт безлимитный доступ."
+        msg = (
+            "✅ Оплата прошла успешно!\n\n"
+            "♾ Вам открыт безлимитный доступ.\n\n"
+            "✨ Теперь можно обратиться к картам.\n"
+            "Выберите, как хотите получить подсказку:"
+        )
     else:
-        msg = f"✅ Оплата прошла успешно!\n\n💫 Начислено запросов: {tariffs[tariff_key]['requests']}."
-    await bot.send_message(user_id, msg, reply_markup=main_keyboard)
+        msg = (
+            "✅ Оплата прошла успешно!\n\n"
+            f"💫 Начислено запросов: {tariffs[tariff_key]['requests']}.\n\n"
+            "✨ Теперь можно обратиться к картам.\n"
+            "Выберите, как хотите получить подсказку:"
+        )
+
+    await bot.send_message(
+        user_id,
+        msg,
+        reply_markup=main_keyboard,
+    )
 
 
 async def reconcile_pending_payments(bot: Bot):
