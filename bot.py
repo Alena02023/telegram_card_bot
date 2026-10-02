@@ -4,7 +4,9 @@ import logging
 import os
 import secrets
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import asyncpg
 from aiohttp import web, ClientSession, BasicAuth
@@ -42,6 +44,7 @@ YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY")
 PORT = int(os.getenv("PORT", "8080"))
 PUBLIC_BASE_URL = "https://devoted-wisdom-production-a9fd.up.railway.app"
 RETURN_URL = f"{PUBLIC_BASE_URL}/payment/return"
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL не найден в переменных окружения")
@@ -168,6 +171,58 @@ def get_consultation_keyboard():
     )
 
 
+def get_reminder_keyboard(card_number: int):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔔 Настроить уведомление",
+                    callback_data=f"reminder_setup_{card_number}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔕 Отключить уведомление",
+                    callback_data="reminder_disable",
+                )
+            ],
+        ]
+    )
+
+
+def get_reminder_time_keyboard(card_number: int):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="10:00",
+                    callback_data=f"reminder_time_{card_number}_10",
+                ),
+                InlineKeyboardButton(
+                    text="14:00",
+                    callback_data=f"reminder_time_{card_number}_14",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="18:00",
+                    callback_data=f"reminder_time_{card_number}_18",
+                ),
+                InlineKeyboardButton(
+                    text="20:00",
+                    callback_data=f"reminder_time_{card_number}_20",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔕 Отключить уведомление",
+                    callback_data="reminder_disable",
+                )
+            ],
+        ]
+    )
+
+
 # =========================================================
 # БАЗА ДАННЫХ
 # =========================================================
@@ -197,6 +252,20 @@ async def init_db():
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 paid_at TIMESTAMPTZ
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS affirmation_reminders (
+                user_id BIGINT PRIMARY KEY,
+                card_number INTEGER NOT NULL,
+                affirmation TEXT NOT NULL,
+                reminder_hour INTEGER NOT NULL,
+                reminders_sent INTEGER NOT NULL DEFAULT 0,
+                next_send_at TIMESTAMPTZ NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """
         )
@@ -326,6 +395,171 @@ async def mark_intro_seen(user_id: int):
         )
     finally:
         await conn.close()
+
+
+# =========================================================
+# НАПОМИНАНИЯ С АФФИРМАЦИЕЙ
+# =========================================================
+
+def extract_affirmation(description: str) -> str | None:
+    """Достаёт аффирмацию из полного описания карты."""
+    marker = "Аффирмация карты:"
+    position = description.lower().rfind(marker.lower())
+    if position == -1:
+        return None
+
+    affirmation = description[position + len(marker):].strip()
+    return affirmation or None
+
+
+def next_moscow_reminder(hour: int) -> datetime:
+    """Ближайшее выбранное время по Москве, сохранённое как UTC."""
+    now_moscow = datetime.now(MOSCOW_TZ)
+    candidate = now_moscow.replace(
+        hour=hour,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if candidate <= now_moscow:
+        candidate += timedelta(days=1)
+    return candidate.astimezone(timezone.utc)
+
+
+async def save_affirmation_reminder(
+    user_id: int,
+    card_number: int,
+    affirmation: str,
+    hour: int,
+):
+    next_send_at = next_moscow_reminder(hour)
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute(
+            """
+            INSERT INTO affirmation_reminders(
+                user_id, card_number, affirmation, reminder_hour,
+                reminders_sent, next_send_at, active, updated_at
+            )
+            VALUES($1, $2, $3, $4, 0, $5, TRUE, NOW())
+            ON CONFLICT(user_id) DO UPDATE SET
+                card_number = EXCLUDED.card_number,
+                affirmation = EXCLUDED.affirmation,
+                reminder_hour = EXCLUDED.reminder_hour,
+                reminders_sent = 0,
+                next_send_at = EXCLUDED.next_send_at,
+                active = TRUE,
+                updated_at = NOW()
+            """,
+            user_id,
+            card_number,
+            affirmation,
+            hour,
+            next_send_at,
+        )
+    finally:
+        await conn.close()
+
+
+async def disable_affirmation_reminder(user_id: int) -> bool:
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        result = await conn.execute(
+            """
+            UPDATE affirmation_reminders
+            SET active = FALSE, updated_at = NOW()
+            WHERE user_id = $1 AND active = TRUE
+            """,
+            user_id,
+        )
+        return result.endswith("1")
+    finally:
+        await conn.close()
+
+
+async def affirmation_reminder_loop(bot: Bot):
+    """Отправляет активные напоминания; состояние хранится в PostgreSQL."""
+    while True:
+        try:
+            conn = await asyncpg.connect(DATABASE_URL)
+            try:
+                rows = await conn.fetch(
+                    """
+                    SELECT user_id, card_number, affirmation,
+                           reminder_hour, reminders_sent
+                    FROM affirmation_reminders
+                    WHERE active = TRUE
+                      AND next_send_at <= NOW()
+                    ORDER BY next_send_at
+                    """
+                )
+            finally:
+                await conn.close()
+
+            for row in rows:
+                user_id = int(row["user_id"])
+                sent = int(row["reminders_sent"])
+                try:
+                    await bot.send_message(
+                        user_id,
+                        "🔔 Время вашей аффирмации\n\n"
+                        f"✨ {row['affirmation']}\n\n"
+                        f"День {sent + 1} из 7.",
+                    )
+                except Exception:
+                    logging.exception(
+                        "Не удалось отправить напоминание пользователю %s",
+                        user_id,
+                    )
+                    continue
+
+                conn = await asyncpg.connect(DATABASE_URL)
+                try:
+                    async with conn.transaction():
+                        current = await conn.fetchrow(
+                            """
+                            SELECT reminders_sent, active
+                            FROM affirmation_reminders
+                            WHERE user_id = $1
+                            FOR UPDATE
+                            """,
+                            user_id,
+                        )
+                        if not current or not current["active"]:
+                            continue
+
+                        new_sent = int(current["reminders_sent"]) + 1
+                        if new_sent >= 7:
+                            await conn.execute(
+                                """
+                                UPDATE affirmation_reminders
+                                SET reminders_sent = $2,
+                                    active = FALSE,
+                                    updated_at = NOW()
+                                WHERE user_id = $1
+                                """,
+                                user_id,
+                                new_sent,
+                            )
+                        else:
+                            await conn.execute(
+                                """
+                                UPDATE affirmation_reminders
+                                SET reminders_sent = $2,
+                                    next_send_at = next_send_at + INTERVAL '1 day',
+                                    updated_at = NOW()
+                                WHERE user_id = $1
+                                """,
+                                user_id,
+                                new_sent,
+                            )
+                finally:
+                    await conn.close()
+
+        except Exception:
+            logging.exception("Ошибка фоновой отправки аффирмаций")
+
+        await asyncio.sleep(30)
 
 
 # =========================================================
@@ -665,6 +899,19 @@ async def send_card(
     for part in text_parts:
         await message.answer(part)
 
+    affirmation = extract_affirmation(description)
+    if affirmation:
+        await message.answer(
+            "✨ Хотите, чтобы я напоминала вам об аффирмации этой карты "
+            "7 дней подряд?",
+            reply_markup=get_reminder_keyboard(card_number),
+        )
+    else:
+        logging.warning(
+            "У карты №%s не найдена строка «Аффирмация карты:»",
+            card_number,
+        )
+
     balance, unlimited = await get_access(user_id)
 
     if unlimited:
@@ -947,6 +1194,93 @@ async def back_to_tariffs_callback(callback: CallbackQuery):
         )
 
 
+
+
+# =========================================================
+# НАПОМИНАНИЯ: НАСТРОЙКА / ОТКЛЮЧЕНИЕ
+# =========================================================
+
+@dp.callback_query(F.data.startswith("reminder_setup_"))
+async def reminder_setup_callback(callback: CallbackQuery):
+    await callback.answer()
+    if not callback.message:
+        return
+
+    try:
+        card_number = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        return
+
+    if card_number not in cards:
+        return
+
+    await callback.message.answer(
+        "🔔 Выберите время напоминания по Москве (МСК):",
+        reply_markup=get_reminder_time_keyboard(card_number),
+    )
+
+
+@dp.callback_query(F.data.startswith("reminder_time_"))
+async def reminder_time_callback(callback: CallbackQuery):
+    if not callback.message:
+        await callback.answer()
+        return
+
+    try:
+        _, _, card_text, hour_text = callback.data.split("_")
+        card_number = int(card_text)
+        hour = int(hour_text)
+    except (TypeError, ValueError):
+        await callback.answer("Не удалось выбрать время.", show_alert=True)
+        return
+
+    if card_number not in cards or hour not in (10, 14, 18, 20):
+        await callback.answer("Некорректное время.", show_alert=True)
+        return
+
+    affirmation = extract_affirmation(cards[card_number]["description"])
+    if not affirmation:
+        await callback.answer(
+            "У этой карты не найдена аффирмация.",
+            show_alert=True,
+        )
+        return
+
+    await save_affirmation_reminder(
+        callback.from_user.id,
+        card_number,
+        affirmation,
+        hour,
+    )
+    await callback.answer("Напоминание включено.")
+    await callback.message.answer(
+        f"🔔 Готово! 7 дней подряд я буду присылать аффирмацию "
+        f"этой карты в {hour:02d}:00 по Москве.\n\n"
+        "Отключить напоминание можно кнопкой ниже.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="🔕 Отключить уведомление",
+                    callback_data="reminder_disable",
+                )
+            ]]
+        ),
+    )
+
+
+@dp.callback_query(F.data == "reminder_disable")
+async def reminder_disable_callback(callback: CallbackQuery):
+    disabled = await disable_affirmation_reminder(callback.from_user.id)
+    await callback.answer()
+    if callback.message:
+        if disabled:
+            await callback.message.answer("🔕 Напоминание отключено.")
+        else:
+            await callback.message.answer(
+                "🔕 Активных напоминаний сейчас нет."
+            )
+
+
 @dp.message(F.text == "💬 Личная консультация")
 async def consultation_handler(message: Message):
     await message.answer(
@@ -1028,15 +1362,20 @@ async def main():
     logging.info("HTTP-сервер запущен на порту %s", PORT)
 
     reconciliation_task = asyncio.create_task(payment_reconciliation_loop(bot))
+    reminder_task = asyncio.create_task(affirmation_reminder_loop(bot))
 
     try:
         await dp.start_polling(bot)
     finally:
         reconciliation_task.cancel()
-        try:
-            await reconciliation_task
-        except asyncio.CancelledError:
-            pass
+        reminder_task.cancel()
+
+        for task in (reconciliation_task, reminder_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
         await runner.cleanup()
         await bot.session.close()
 
