@@ -446,15 +446,53 @@ async def yookassa_webhook(request: web.Request):
         result = await apply_successful_payment(payment_id)
         if result:
             user_id, tariff_key = result
-            if tariff_key == "unlimited":
-                msg = "✅ Оплата прошла успешно!\n\n♾ Вам открыт безлимитный доступ."
-            else:
-                msg = f"✅ Оплата прошла успешно!\n\n💫 Начислено запросов: {tariffs[tariff_key]['requests']}."
-            await bot.send_message(user_id, msg, reply_markup=main_keyboard)
+            await notify_successful_payment(bot, user_id, tariff_key)
         return web.Response(status=200)
     except Exception:
         logging.exception("Ошибка webhook YooKassa")
         return web.Response(status=500)
+
+
+async def notify_successful_payment(bot: Bot, user_id: int, tariff_key: str):
+    if tariff_key == "unlimited":
+        msg = "✅ Оплата прошла успешно!\n\n♾ Вам открыт безлимитный доступ."
+    else:
+        msg = f"✅ Оплата прошла успешно!\n\n💫 Начислено запросов: {tariffs[tariff_key]['requests']}."
+    await bot.send_message(user_id, msg, reply_markup=main_keyboard)
+
+
+async def reconcile_pending_payments(bot: Bot):
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        rows = await conn.fetch("SELECT payment_id FROM payments WHERE status='pending' ORDER BY created_at")
+    finally:
+        await conn.close()
+
+    if rows:
+        logging.info("Сверка YooKassa: pending-платежей: %s", len(rows))
+
+    for row in rows:
+        payment_id = row["payment_id"]
+        try:
+            result = await apply_successful_payment(payment_id)
+            if result:
+                user_id, tariff_key = result
+                logging.info("Сверка YooKassa: платёж %s подтверждён, доступ начислен пользователю %s", payment_id, user_id)
+                try:
+                    await notify_successful_payment(bot, user_id, tariff_key)
+                except Exception:
+                    logging.exception("Не удалось отправить сообщение об оплате пользователю %s", user_id)
+        except Exception:
+            logging.exception("Ошибка сверки pending-платежа YooKassa %s", payment_id)
+
+
+async def payment_reconciliation_loop(bot: Bot):
+    while True:
+        try:
+            await reconcile_pending_payments(bot)
+        except Exception:
+            logging.exception("Ошибка фоновой сверки платежей YooKassa")
+        await asyncio.sleep(60)
 
 
 async def payment_return(request: web.Request):
@@ -973,9 +1011,16 @@ async def main():
     await site.start()
     logging.info("HTTP-сервер запущен на порту %s", PORT)
 
+    reconciliation_task = asyncio.create_task(payment_reconciliation_loop(bot))
+
     try:
         await dp.start_polling(bot)
     finally:
+        reconciliation_task.cancel()
+        try:
+            await reconciliation_task
+        except asyncio.CancelledError:
+            pass
         await runner.cleanup()
         await bot.session.close()
 
