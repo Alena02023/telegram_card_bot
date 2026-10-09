@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -45,6 +46,9 @@ PORT = int(os.getenv("PORT", "8080"))
 PUBLIC_BASE_URL = "https://devoted-wisdom-production-a9fd.up.railway.app"
 RETURN_URL = f"{PUBLIC_BASE_URL}/payment/return"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+EMAIL_THRESHOLD = 7000
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+pending_email_tariffs = {}
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL не найден в переменных окружения")
@@ -255,6 +259,7 @@ async def init_db():
             )
             """
         )
+        await conn.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS customer_email TEXT")
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS affirmation_reminders (
@@ -566,7 +571,7 @@ async def affirmation_reminder_loop(bot: Bot):
 # YOOKASSA
 # =========================================================
 
-async def create_yookassa_payment(user_id: int, tariff_key: str):
+async def create_yookassa_payment(user_id: int, tariff_key: str, customer_email: str | None = None):
     tariff = tariffs[tariff_key]
     payload = {
         "amount": {"value": f"{tariff['price']:.2f}", "currency": "RUB"},
@@ -579,6 +584,9 @@ async def create_yookassa_payment(user_id: int, tariff_key: str):
             "tariff_key": tariff_key,
         },
     }
+    if customer_email:
+        payload["metadata"]["customer_email"] = customer_email
+
     auth = BasicAuth(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
     async with ClientSession(auth=auth) as session:
         async with session.post(
@@ -598,9 +606,9 @@ async def create_yookassa_payment(user_id: int, tariff_key: str):
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         await conn.execute(
-            """INSERT INTO payments(payment_id,user_id,tariff_key,amount_kopecks,status)
-               VALUES($1,$2,$3,$4,'pending') ON CONFLICT(payment_id) DO NOTHING""",
-            payment_id, user_id, tariff_key, tariff["price"] * 100,
+            """INSERT INTO payments(payment_id,user_id,tariff_key,amount_kopecks,status,customer_email)
+               VALUES($1,$2,$3,$4,'pending',$5) ON CONFLICT(payment_id) DO NOTHING""",
+            payment_id, user_id, tariff_key, tariff["price"] * 100, customer_email,
         )
     finally:
         await conn.close()
@@ -939,6 +947,7 @@ dp = Dispatcher()
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     user_id = message.from_user.id
+    pending_email_tariffs.pop(user_id, None)
     await create_user(user_id)
 
     if await has_seen_intro(user_id):
@@ -1156,32 +1165,55 @@ async def show_tariffs_callback(
 # ВЫБОР ТАРИФА
 # =========================================================
 
+async def send_payment_link(message: Message, user_id: int, tariff_key: str, email: str | None = None):
+    tariff = tariffs[tariff_key]
+    try:
+        url = await create_yookassa_payment(user_id, tariff_key, email)
+    except Exception:
+        logging.exception("Ошибка создания платежа")
+        await message.answer("Не удалось создать платёж. Попробуйте немного позже.")
+        return
+    await message.answer(
+        "✨ Вы выбрали:\\n\\n"
+        f"{tariff['label']}\\n\\n"
+        "Нажмите кнопку ниже для оплаты через СБП.\\n"
+        "Доступ будет начислен автоматически после подтверждения оплаты.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Оплатить {tariff['price']} ₽", url=url)],
+            [InlineKeyboardButton(text="← Назад к тарифам", callback_data="back_to_tariffs")],
+        ]),
+    )
+
+
 @dp.callback_query(F.data.startswith("tariff_"))
 async def tariff_callback(callback: CallbackQuery):
     await callback.answer()
     tariff_key = callback.data.replace("tariff_", "", 1)
     if tariff_key not in tariffs or not callback.message:
         return
-    tariff = tariffs[tariff_key]
-    try:
-        url = await create_yookassa_payment(callback.from_user.id, tariff_key)
-    except Exception:
-        logging.exception("Ошибка создания платежа")
-        await callback.message.answer("Не удалось создать платёж. Попробуйте немного позже.")
+    user_id = callback.from_user.id
+    pending_email_tariffs.pop(user_id, None)
+    if tariffs[tariff_key]["price"] >= EMAIL_THRESHOLD:
+        pending_email_tariffs[user_id] = tariff_key
+        await callback.message.answer(
+            "✉️ Для оформления оплаты укажите ваш email.\\n"
+            "Он будет сохранён с платежом, но сам по себе не обеспечивает "
+            "отправку письма от ЮKassa.\\n\\n"
+            "Для отмены отправьте /start."
+        )
         return
+    await send_payment_link(callback.message, user_id, tariff_key)
 
-    await callback.message.edit_text(
-        "✨ Вы выбрали:\n\n"
-        f"{tariff['label']}\n\n"
-        "Нажмите кнопку ниже для оплаты через СБП.\n"
-        "Доступ будет начислен автоматически после подтверждения оплаты.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text=f"💳 Оплатить {tariff['price']} ₽", url=url)],
-                [InlineKeyboardButton(text="← Назад к тарифам", callback_data="back_to_tariffs")],
-            ]
-        ),
-    )
+
+@dp.message(F.text, lambda message: message.from_user is not None and message.from_user.id in pending_email_tariffs)
+async def payment_email_handler(message: Message):
+    user_id = message.from_user.id
+    email = (message.text or "").strip()
+    if len(email) > 254 or not EMAIL_RE.fullmatch(email):
+        await message.answer("Введите корректный email, например name@example.com. Для отмены: /start.")
+        return
+    tariff_key = pending_email_tariffs.pop(user_id)
+    await send_payment_link(message, user_id, tariff_key, email)
 
 
 @dp.callback_query(F.data == "back_to_tariffs")
