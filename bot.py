@@ -3,8 +3,6 @@ import json
 import logging
 import os
 import re
-import smtplib
-from email.message import EmailMessage
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -48,10 +46,9 @@ PORT = int(os.getenv("PORT", "8080"))
 PUBLIC_BASE_URL = "https://devoted-wisdom-production-a9fd.up.railway.app"
 RETURN_URL = f"{PUBLIC_BASE_URL}/payment/return"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-SMTP_HOST = "smtp.mail.ru"
-SMTP_PORT = 465
-SMTP_USER = "Volowka@mail.ru"
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+UNISENDER_API_KEY = os.getenv("UNISENDER_API_KEY")
+UNISENDER_FROM_EMAIL = os.getenv("UNISENDER_FROM_EMAIL", "")
+UNISENDER_API_URL = "https://goapi.unisender.ru/ru/transactional/api/v1/email/send.json"
 EMAIL_THRESHOLD = 7000
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 pending_email_tariffs = {}
@@ -752,36 +749,48 @@ async def reconcile_pending_payments(bot: Bot):
             logging.exception("Ошибка сверки pending-платежа YooKassa %s", payment_id)
 
 
-def send_payment_confirmation_email(recipient: str, payment_id: str, tariff_key: str, paid_at: datetime):
-    """Отправка простого подтверждения оплаты (не налогового чека)."""
-    if not SMTP_PASSWORD:
-        raise RuntimeError("SMTP_PASSWORD не задан в Railway Variables")
+async def send_payment_confirmation_email(recipient: str, payment_id: str, tariff_key: str, paid_at: datetime):
+    """Отправляет информационное подтверждение оплаты через Unisender Go HTTPS API."""
+    if not UNISENDER_API_KEY or not UNISENDER_FROM_EMAIL:
+        raise RuntimeError("Укажите UNISENDER_API_KEY и UNISENDER_FROM_EMAIL в Railway Variables")
     tariff = tariffs[tariff_key]
     paid_moscow = paid_at.astimezone(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M МСК")
-    msg = EmailMessage()
-    msg["From"] = SMTP_USER
-    msg["To"] = recipient
-    msg["Subject"] = "Подтверждение оплаты — Следы праматери"
-    msg.set_content(
-        "Здравствуйте!\\n\\n"
-        "Ваша оплата успешно получена.\\n\\n"
-        f"Услуга: Следы праматери — {tariff['label']}\\n"
-        f"Сумма: {tariff['price']} ₽\\n"
-        f"Дата оплаты: {paid_moscow}\\n"
-        f"Номер платежа: {payment_id}\\n\\n"
-        "Доступ к картам начислен в Telegram-боте @Shaman_karta_bot.\\n\\n"
-        "Это информационное подтверждение оплаты, не налоговый чек.\\n"
+    body = (
+        "Здравствуйте!\n\n"
+        "Ваша оплата успешно получена.\n\n"
+        f"Услуга: Следы праматери — {tariff['label']}\n"
+        f"Сумма: {tariff['price']} ₽\n"
+        f"Дата оплаты: {paid_moscow}\n"
+        f"Номер платежа: {payment_id}\n\n"
+        "Доступ к картам начислен в Telegram-боте @Shaman_karta_bot.\n\n"
+        "Это информационное подтверждение оплаты, не налоговый чек.\n"
     )
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
-        smtp.login(SMTP_USER, SMTP_PASSWORD)
-        smtp.send_message(msg)
+    payload = {
+        "message": {
+            "recipients": [{"email": recipient}],
+            "from_email": UNISENDER_FROM_EMAIL,
+            "from_name": "Следы праматери",
+            "subject": "Подтверждение оплаты — Следы праматери",
+            "body": {"plaintext": body},
+            "idempotence_key": payment_id,
+        }
+    }
+    headers = {"X-API-KEY": UNISENDER_API_KEY}
+    timeout = __import__("aiohttp").ClientTimeout(total=25)
+    async with ClientSession(timeout=timeout) as session:
+        async with session.post(UNISENDER_API_URL, json=payload, headers=headers) as response:
+            data = await response.json(content_type=None)
+            if response.status >= 300 or data.get("status") == "error":
+                raise RuntimeError(f"Unisender Go: HTTP {response.status}: {data}")
+            if data.get("failed_emails") or data.get("result", {}).get("failed_emails"):
+                raise RuntimeError(f"Unisender Go отклонил получателя: {data}")
 
 
 async def payment_confirmation_email_loop():
     """Периодически отправляет письма по оплаченным заказам от 7000 ₽."""
     while True:
         try:
-            if SMTP_PASSWORD:
+            if UNISENDER_API_KEY and UNISENDER_FROM_EMAIL:
                 conn = await asyncpg.connect(DATABASE_URL)
                 try:
                     # Временная отметка предотвращает параллельную отправку
@@ -810,8 +819,7 @@ async def payment_confirmation_email_loop():
 
                 for row in rows:
                     try:
-                        await asyncio.to_thread(
-                            send_payment_confirmation_email,
+                        await send_payment_confirmation_email(
                             row["customer_email"],
                             row["payment_id"],
                             row["tariff_key"],
@@ -831,7 +839,7 @@ async def payment_confirmation_email_loop():
                     except Exception:
                         logging.exception("Не удалось отправить email для платежа %s", row["payment_id"])
             else:
-                logging.warning("SMTP_PASSWORD не задан: письма об оплате не отправляются")
+                logging.warning("UNISENDER_API_KEY или UNISENDER_FROM_EMAIL не задан: письма не отправляются")
         except Exception:
             logging.exception("Ошибка фоновой отправки подтверждений оплаты")
         await asyncio.sleep(60)
