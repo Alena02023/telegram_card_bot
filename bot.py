@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import re
+import smtplib
+from email.message import EmailMessage
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -46,6 +48,10 @@ PORT = int(os.getenv("PORT", "8080"))
 PUBLIC_BASE_URL = "https://devoted-wisdom-production-a9fd.up.railway.app"
 RETURN_URL = f"{PUBLIC_BASE_URL}/payment/return"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+SMTP_HOST = "smtp.mail.ru"
+SMTP_PORT = 465
+SMTP_USER = "Volowka@mail.ru"
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 EMAIL_THRESHOLD = 7000
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 pending_email_tariffs = {}
@@ -260,6 +266,8 @@ async def init_db():
             """
         )
         await conn.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS customer_email TEXT")
+        await conn.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS confirmation_emailed_at TIMESTAMPTZ")
+        await conn.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS confirmation_email_claimed_at TIMESTAMPTZ")
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS affirmation_reminders (
@@ -742,6 +750,91 @@ async def reconcile_pending_payments(bot: Bot):
                     logging.exception("Не удалось отправить сообщение об оплате пользователю %s", user_id)
         except Exception:
             logging.exception("Ошибка сверки pending-платежа YooKassa %s", payment_id)
+
+
+def send_payment_confirmation_email(recipient: str, payment_id: str, tariff_key: str, paid_at: datetime):
+    """Отправка простого подтверждения оплаты (не налогового чека)."""
+    if not SMTP_PASSWORD:
+        raise RuntimeError("SMTP_PASSWORD не задан в Railway Variables")
+    tariff = tariffs[tariff_key]
+    paid_moscow = paid_at.astimezone(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M МСК")
+    msg = EmailMessage()
+    msg["From"] = SMTP_USER
+    msg["To"] = recipient
+    msg["Subject"] = "Подтверждение оплаты — Следы праматери"
+    msg.set_content(
+        "Здравствуйте!\\n\\n"
+        "Ваша оплата успешно получена.\\n\\n"
+        f"Услуга: Следы праматери — {tariff['label']}\\n"
+        f"Сумма: {tariff['price']} ₽\\n"
+        f"Дата оплаты: {paid_moscow}\\n"
+        f"Номер платежа: {payment_id}\\n\\n"
+        "Доступ к картам начислен в Telegram-боте @Shaman_karta_bot.\\n\\n"
+        "Это информационное подтверждение оплаты, не налоговый чек.\\n"
+    )
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+        smtp.login(SMTP_USER, SMTP_PASSWORD)
+        smtp.send_message(msg)
+
+
+async def payment_confirmation_email_loop():
+    """Периодически отправляет письма по оплаченным заказам от 7000 ₽."""
+    while True:
+        try:
+            if SMTP_PASSWORD:
+                conn = await asyncpg.connect(DATABASE_URL)
+                try:
+                    # Временная отметка предотвращает параллельную отправку
+                    # из двух запущенных экземпляров бота.
+                    rows = await conn.fetch(
+                        """
+                        UPDATE payments
+                        SET confirmation_email_claimed_at = NOW()
+                        WHERE payment_id IN (
+                            SELECT payment_id FROM payments
+                            WHERE status = 'succeeded'
+                              AND amount_kopecks >= 700000
+                              AND customer_email IS NOT NULL
+                              AND confirmation_emailed_at IS NULL
+                              AND (confirmation_email_claimed_at IS NULL
+                                   OR confirmation_email_claimed_at < NOW() - INTERVAL '10 minutes')
+                            ORDER BY paid_at
+                            LIMIT 10
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        RETURNING payment_id, tariff_key, customer_email, paid_at
+                        """
+                    )
+                finally:
+                    await conn.close()
+
+                for row in rows:
+                    try:
+                        await asyncio.to_thread(
+                            send_payment_confirmation_email,
+                            row["customer_email"],
+                            row["payment_id"],
+                            row["tariff_key"],
+                            row["paid_at"],
+                        )
+                        conn = await asyncpg.connect(DATABASE_URL)
+                        try:
+                            await conn.execute(
+                                """UPDATE payments
+                                   SET confirmation_emailed_at = NOW()
+                                   WHERE payment_id = $1 AND confirmation_emailed_at IS NULL""",
+                                row["payment_id"],
+                            )
+                        finally:
+                            await conn.close()
+                        logging.info("Подтверждение оплаты отправлено для платежа %s", row["payment_id"])
+                    except Exception:
+                        logging.exception("Не удалось отправить email для платежа %s", row["payment_id"])
+            else:
+                logging.warning("SMTP_PASSWORD не задан: письма об оплате не отправляются")
+        except Exception:
+            logging.exception("Ошибка фоновой отправки подтверждений оплаты")
+        await asyncio.sleep(60)
 
 
 async def payment_reconciliation_loop(bot: Bot):
@@ -1395,14 +1488,16 @@ async def main():
 
     reconciliation_task = asyncio.create_task(payment_reconciliation_loop(bot))
     reminder_task = asyncio.create_task(affirmation_reminder_loop(bot))
+    email_task = asyncio.create_task(payment_confirmation_email_loop())
 
     try:
         await dp.start_polling(bot)
     finally:
         reconciliation_task.cancel()
         reminder_task.cancel()
+        email_task.cancel()
 
-        for task in (reconciliation_task, reminder_task):
+        for task in (reconciliation_task, reminder_task, email_task):
             try:
                 await task
             except asyncio.CancelledError:
